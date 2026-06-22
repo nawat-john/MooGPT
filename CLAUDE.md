@@ -90,11 +90,14 @@ build/test_ops.exe        # Phase 0: tensor + ops
 
 g++ -std=c++17 -static -Wall -Wextra -Wpedantic -I src src/tokenizer.cpp src/dataloader.cpp tests/test_data.cpp -o build/test_data.exe
 build/test_data.exe       # Phase 1: tokenizer + dataloader
+
+g++ -std=c++17 -static -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/ops.cpp src/loss.cpp tests/test_grad.cpp -o build/test_grad.exe
+build/test_grad.exe       # Phase 3: finite-difference gradient checks
 ```
-Build the full CLI (`demo`/`check`/`generate` work; `train` is a Phase 4 stub):
+Build the full CLI (`demo`/`check`/`grads`/`generate` work; `train` is a Phase 4 stub):
 ```
 g++ -std=c++17 -O2 -static -I src src/tensor.cpp src/ops.cpp src/tokenizer.cpp src/dataloader.cpp \
-    src/attention.cpp src/mlp.cpp src/block.cpp src/model.cpp src/main.cpp -o build/moogpt.exe
+    src/attention.cpp src/mlp.cpp src/block.cpp src/model.cpp src/loss.cpp src/main.cpp -o build/moogpt.exe
 ```
 When new `.cpp` files land, add them to both the g++ command and the `moocore` library in
 `CMakeLists.txt`. Once CMake is installed, prefer `cmake -S . -B build && cmake --build build`
@@ -121,6 +124,21 @@ and `model.cpp::GPT::load` — changing the parameter set means editing **both**
 **Matching subtleties** (where two "correct" transformers diverge): exact erf GELU on both sides
 (not tanh), LayerNorm biased variance + eps 1e-5, `nn.Linear` weight layout `(out,in)`, explicit
 (non-fused) attention, fused-QKV split order `[Q|K|V]`, untied lm_head. See `docs/notes.md` Phase 2.
+
+### Phase 3 verification gate (C++ gradients vs PyTorch autograd)
+
+Two checks, both must pass. (1) C++ finite differences: `build/test_grad.exe`. (2) Autograd, from
+a clean shell after building `moogpt.exe`:
+```
+python reference/export_weights.py     # now also writes targets.bin + ref_grads.bin (loss+grads)
+build/moogpt.exe grads reference/artifacts/weights.bin reference/artifacts/input.bin reference/artifacts/targets.bin reference/artifacts/cpp_grads.bin
+python reference/check_grads.py         # per-parameter compare, rtol 1e-3 (currently worst ~4e-4)
+```
+Backward design: every `*_backward` helper returns `dx` and **accumulates** (`+=`) into the param
+grad buffers, so `model.zero_grad()` must run before `model.backward()`. `forward()` is non-const
+(it caches activations); `parameters()`/`gradients()` expose the canonical-order tensors that both
+the grad file format and the FD check rely on. Derivations for every op (incl. the attention
+backward) are in `docs/notes.md` Phase 3.
 
 ## Data plan (Phase 5)
 

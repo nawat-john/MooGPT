@@ -21,6 +21,7 @@ import struct
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from model import GPT, GPTConfig
 
@@ -31,26 +32,40 @@ def f32(t: torch.Tensor) -> np.ndarray:
     return t.detach().contiguous().float().numpy().ravel()
 
 
-def canonical_tensors(model: GPT):
-    """Yield parameter arrays in the exact order the C++ loader reads them."""
-    yield f32(model.wte.weight)            # (V, C)
-    yield f32(model.wpe.weight)            # (block_size, C)
+def _ordered_params(model: GPT):
+    """The model's parameters in the canonical order shared by the C++ loader, the
+    weight file, and the gradient file. Yields the nn.Parameter objects themselves."""
+    yield model.wte.weight             # (V, C)
+    yield model.wpe.weight             # (block_size, C)
     for blk in model.h:
-        yield f32(blk.ln_1.weight)
-        yield f32(blk.ln_1.bias)
-        yield f32(blk.attn.c_attn.weight)  # (3C, C)
-        yield f32(blk.attn.c_attn.bias)    # (3C,)
-        yield f32(blk.attn.c_proj.weight)  # (C, C)
-        yield f32(blk.attn.c_proj.bias)    # (C,)
-        yield f32(blk.ln_2.weight)
-        yield f32(blk.ln_2.bias)
-        yield f32(blk.mlp.c_fc.weight)     # (4C, C)
-        yield f32(blk.mlp.c_fc.bias)       # (4C,)
-        yield f32(blk.mlp.c_proj.weight)   # (C, 4C)
-        yield f32(blk.mlp.c_proj.bias)     # (C,)
-    yield f32(model.ln_f.weight)
-    yield f32(model.ln_f.bias)
-    yield f32(model.lm_head.weight)        # (V, C)
+        yield blk.ln_1.weight
+        yield blk.ln_1.bias
+        yield blk.attn.c_attn.weight   # (3C, C)
+        yield blk.attn.c_attn.bias     # (3C,)
+        yield blk.attn.c_proj.weight   # (C, C)
+        yield blk.attn.c_proj.bias     # (C,)
+        yield blk.ln_2.weight
+        yield blk.ln_2.bias
+        yield blk.mlp.c_fc.weight      # (4C, C)
+        yield blk.mlp.c_fc.bias        # (4C,)
+        yield blk.mlp.c_proj.weight    # (C, 4C)
+        yield blk.mlp.c_proj.bias      # (C,)
+    yield model.ln_f.weight
+    yield model.ln_f.bias
+    yield model.lm_head.weight         # (V, C)
+
+
+def canonical_tensors(model: GPT):
+    """Parameter values in canonical order."""
+    for p in _ordered_params(model):
+        yield f32(p)
+
+
+def canonical_grads(model: GPT):
+    """Parameter gradients in canonical order (after a backward pass)."""
+    for p in _ordered_params(model):
+        assert p.grad is not None, "missing grad — did loss.backward() run?"
+        yield f32(p.grad)
 
 
 def write_weights(path, model: GPT):
@@ -77,6 +92,15 @@ def write_logits(path, logits: np.ndarray):
         f.write(logits.astype("<f4").tobytes())
 
 
+def write_grads(path, loss: float, model: GPT):
+    # float32 loss, then every parameter gradient concatenated in canonical order —
+    # matching the C++ `grads` subcommand output.
+    with open(path, "wb") as f:
+        f.write(struct.pack("<f", loss))
+        for arr in canonical_grads(model):
+            f.write(arr.astype("<f4").tobytes())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--outdir", default=os.path.join(os.path.dirname(__file__), "artifacts"))
@@ -100,17 +124,25 @@ def main():
 
     assert args.seqlen <= cfg.block_size, "seqlen must be <= block_size"
     ids = np.random.randint(0, cfg.vocab_size, size=args.seqlen)
+    targets = np.random.randint(0, cfg.vocab_size, size=args.seqlen)
 
-    with torch.no_grad():
-        logits = model(torch.tensor(ids, dtype=torch.long)).numpy()
+    # Forward (grad-enabled), cross-entropy loss, backward — the reference gradients.
+    model.zero_grad(set_to_none=False)
+    logits_t = model(torch.tensor(ids, dtype=torch.long))           # (T, V)
+    loss = F.cross_entropy(logits_t, torch.tensor(targets, dtype=torch.long))
+    loss.backward()
+    logits = logits_t.detach().numpy()
 
     write_weights(os.path.join(args.outdir, "weights.bin"), model)
     write_input(os.path.join(args.outdir, "input.bin"), ids)
+    write_input(os.path.join(args.outdir, "targets.bin"), targets)
     write_logits(os.path.join(args.outdir, "ref_logits.bin"), logits)
+    write_grads(os.path.join(args.outdir, "ref_grads.bin"), float(loss.item()), model)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"exported model: {n_params} params, config={cfg}")
     print(f"  input seqlen={args.seqlen}, logits shape={logits.shape}")
+    print(f"  reference loss={loss.item():.6f}")
     print(f"  artifacts in {args.outdir}")
 
 

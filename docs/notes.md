@@ -207,6 +207,108 @@ Context is cropped to the last `block_size` tokens each step.
 
 ---
 
+## Phase 3 — Loss & Backward Pass (the core phase)
+
+Hand-derived backprop through every op. Verified two ways: C++ finite differences
+(`test_grad`) and PyTorch autograd (`check_grads.py`). All 40 parameter tensors match
+autograd to **worst relative diff ~4e-4**; loss matches to ~5e-7.
+
+### Convention
+
+Each backward helper takes upstream `dy` (shape of the op's output), returns `dx`, and
+**accumulates** (`+=`) into the parameter-gradient buffers. Accumulation (not assignment)
+is what lets a parameter reached by several paths sum its contributions — e.g. an
+embedding row hit by a repeated token, or the residual stream. Callers `zero_grad()` once
+before a backward pass. Modules cache the forward inputs their backward needs.
+
+### Cross-entropy
+
+Per position t with logits z and target y: `loss_t = logsumexp(z) − z[y]`, averaged over T.
+The gradient is the clean softmax−onehot result:
+```
+dlogits[t,:] = (softmax(z_t) − onehot(y_t)) / T
+```
+The `/T` comes from the mean reduction and must be there for the magnitude to match torch.
+
+### Linear  (y = x Wᵀ + b)
+
+```
+dx = dy W          dW += dyᵀ x          db += colsum(dy)
+```
+Implemented in one fused triple loop: for each (t,o), `dx[t,:] += dy·W[o,:]` and
+`dW[o,:] += dy·x[t,:]` share the inner stride over `in`.
+
+### GELU (exact erf)
+
+```
+d/dx [0.5 x (1+erf(x/√2))] = 0.5(1+erf(x/√2)) + x·(1/√(2π))·exp(−x²/2)
+```
+First term is the gelu "gate" (its own CDF), second is `x` times the standard normal PDF.
+
+### LayerNorm
+
+With `xhat = (x−μ)·rstd`, `rstd = 1/√(var+eps)`, `y = γ·xhat + β`:
+```
+dγ += Σ_t dy·xhat        dβ += Σ_t dy
+dxhat = dy·γ
+dx = rstd · (dxhat − mean(dxhat) − xhat·mean(dxhat·xhat))    # per row
+```
+The two subtracted means are the corrections for μ and var both depending on every x in
+the row — the part people get wrong. mean/var are recomputed from x in backward (cheap,
+avoids caching).
+
+### Softmax (row-wise Jacobian-vector product)
+
+```
+dx[i] = y[i] · (dy[i] − Σ_j dy[j] y[j])
+```
+The shared `Σ_j dy[j] y[j]` is the only cross-term; everything else is elementwise.
+
+### Attention backward (the hard one)
+
+Forward per head: `S = (QKᵀ)·scale → causal mask → P = softmax(S) → O = P V`. Going
+backward from `dO` (a slice of the c_proj input gradient):
+```
+dP[i,j] = Σ_e dO[i,e] V[j,e]          dV[j] += Σ_i P[i,j] dO[i]
+dS = softmax_backward(P, dP)          # per row; masked entries have P=0 ⇒ contribute 0
+dQ[i] += scale · Σ_j dS[i,j] K[j]     dK[j] += scale · Σ_i dS[i,j] Q[i]
+```
+Key points:
+- **Causality is automatic in backward.** Masked positions (`j>i`) have `P=0`, so both
+  `dV` and the softmax JVP yield 0 there — no separate masking needed in the backward.
+- **The `scale` reappears** when differentiating `S = (QKᵀ)·scale`.
+- `dQ/dK/dV` are scattered back into the fused `dQKV (T,3C)` at the head's columns, then
+  one `linear_backward` through `c_attn` produces `dx` and the c_attn param grads.
+
+### Block & model wiring
+
+Pre-norm residual `x_out = x + sub(ln(x))` means the input gradient splits in two: the
+direct residual path **plus** the path through the sublayer and its LayerNorm. So each
+block does `dx = dx_residual + ln_backward(sub_backward(dx_residual))`, twice (mlp then
+attn). At the top, the embedding gradient routes the per-position `dx[t]` into **both**
+`d_wte[token[t]]` and `d_wpe[t]` (accumulated).
+
+### Verification harness (Phase 3 additions)
+
+- `export_weights.py` now also picks random `targets`, runs `F.cross_entropy` +
+  `loss.backward()`, and writes `targets.bin` and `ref_grads.bin` (float32 loss + all
+  param grads in canonical order).
+- `moogpt grads weights input targets out` runs the C++ forward+loss+backward and writes
+  the same format.
+- `check_grads.py` reconstructs the parameter layout from the weight header and compares
+  every parameter block (rtol 1e-3), reporting per-parameter max abs/rel diff.
+
+### Gotchas / decisions
+
+- **forward() is now non-const** (it caches activations for backward). `generate()` became
+  non-const as a result. Inference pays the cache cost; fine for a tiny model.
+- FD in fp32 is noisy — `test_grad` uses eps=1e-2 and loose tolerances (rtol 3e-2). It
+  catches sign/factor/structure bugs; the autograd check is the tight one. The two are
+  complementary, satisfying the plan's "both checks must pass" gate.
+- Loss accumulated in `double` inside cross-entropy to keep the scalar stable across T.
+
+---
+
 ## Build environment (this machine)
 
 CMake is **not** installed. Two compilers are present:

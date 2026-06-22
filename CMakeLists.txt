@@ -31,6 +31,7 @@ add_library(moocore
   src/mlp.cpp
   src/block.cpp
   src/model.cpp
+  src/loss.cpp
 )
 target_include_directories(moocore PUBLIC src)
 
@@ -48,3 +49,7 @@ add_test(NAME test_ops COMMAND test_ops)
 add_executable(test_data tests/test_data.cpp)
 target_link_libraries(test_data PRIVATE moocore)
 add_test(NAME test_data COMMAND test_data)
+
+add_executable(test_grad tests/test_grad.cpp)
+target_link_libraries(test_grad PRIVATE moocore)
+add_test(NAME test_grad COMMAND test_grad)

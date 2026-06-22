@@ -11,6 +11,7 @@
 #include <random>
 #include <vector>
 
+#include "loss.h"
 #include "model.h"
 #include "ops.h"
 #include "tensor.h"
@@ -22,6 +23,7 @@ int usage(const char* argv0) {
             << "commands:\n"
             << "  demo                                   Phase 0 matmul demo\n"
             << "  check <weights> <input> <out_logits>   forward pass; dump logits\n"
+            << "  grads <weights> <input> <targets> <out>  forward+loss+backward; dump grads\n"
             << "  generate <weights> <n> [temp] [top_k]  sample n tokens from id 0\n"
             << "  train                                  not implemented yet\n";
   return 2;
@@ -83,6 +85,30 @@ int check(int argc, char** argv) {
   return 0;
 }
 
+// grads file format: float32 loss, then every parameter gradient (float32) concatenated
+// in the model's canonical order — same order as the weight file.
+int grads(int argc, char** argv) {
+  if (argc < 6) return usage(argv[0]);
+  moo::GPT model = moo::GPT::load(argv[2]);
+  std::vector<int> ids = read_input_ids(argv[3]);
+  std::vector<int> targets = read_input_ids(argv[4]);
+
+  moo::Tensor logits = model.forward(ids);
+  moo::Tensor dlogits;
+  float loss = moo::cross_entropy(logits, targets, dlogits);
+  model.zero_grad();
+  model.backward(dlogits);
+
+  std::ofstream f(argv[5], std::ios::binary);
+  f.write(reinterpret_cast<const char*>(&loss), sizeof(loss));
+  for (const moo::Tensor* g : model.gradients()) {
+    f.write(reinterpret_cast<const char*>(g->data()),
+            static_cast<std::streamsize>(g->size() * sizeof(float)));
+  }
+  std::cout << "grads: loss=" << loss << ", wrote gradients to " << argv[5] << "\n";
+  return 0;
+}
+
 int generate(int argc, char** argv) {
   if (argc < 4) return usage(argv[0]);
   moo::GPT model = moo::GPT::load(argv[2]);
@@ -107,6 +133,7 @@ int main(int argc, char** argv) {
 
   if (std::strcmp(cmd, "demo") == 0) return demo();
   if (std::strcmp(cmd, "check") == 0) return check(argc, argv);
+  if (std::strcmp(cmd, "grads") == 0) return grads(argc, argv);
   if (std::strcmp(cmd, "generate") == 0) return generate(argc, argv);
   if (std::strcmp(cmd, "train") == 0) {
     std::cerr << "'train' is not implemented yet (Phase 4).\n";

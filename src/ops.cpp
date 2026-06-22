@@ -163,4 +163,105 @@ Tensor softmax_rows(const Tensor& x) {
   return out;
 }
 
+Tensor linear_backward(const Tensor& x, const Tensor& weight, const Tensor& dy,
+                       Tensor& dW, Tensor& dB) {
+  const int T = x.dim(0);
+  const int in = x.dim(1);
+  const int out = weight.dim(0);
+  require(dy.dim(0) == T && dy.dim(1) == out, "linear_backward: dy shape mismatch");
+  const bool has_bias = dB.size() != 0;
+
+  Tensor dx({T, in});
+  // dx = dy @ W ;  dW += dy^T @ x ;  db += colsum(dy)
+  for (int t = 0; t < T; ++t) {
+    const float* dyr = dy.data() + t * out;
+    const float* xr = x.data() + t * in;
+    float* dxr = dx.data() + t * in;
+    for (int o = 0; o < out; ++o) {
+      const float g = dyr[o];
+      const float* wr = weight.data() + o * in;
+      float* dWr = dW.data() + o * in;
+      for (int i = 0; i < in; ++i) {
+        dxr[i] += g * wr[i];   // dx[t,i] += dy[t,o] * W[o,i]
+        dWr[i] += g * xr[i];   // dW[o,i] += dy[t,o] * x[t,i]
+      }
+      if (has_bias) dB[o] += g;
+    }
+  }
+  return dx;
+}
+
+Tensor gelu_backward(const Tensor& x, const Tensor& dy) {
+  Tensor dx(x.shape());
+  const float inv_sqrt2 = 0.70710678118654752440f;    // 1/sqrt(2)
+  const float inv_sqrt2pi = 0.39894228040143267794f;  // 1/sqrt(2*pi)
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    const float v = x[i];
+    // d/dx [0.5 x (1+erf(x/√2))] = 0.5(1+erf(x/√2)) + x * (1/√(2π)) exp(-x²/2)
+    const float cdf = 0.5f * (1.0f + std::erf(v * inv_sqrt2));
+    const float pdf = inv_sqrt2pi * std::exp(-0.5f * v * v);
+    dx[i] = dy[i] * (cdf + v * pdf);
+  }
+  return dx;
+}
+
+Tensor layernorm_backward(const Tensor& x, const Tensor& gamma, const Tensor& dy,
+                          Tensor& dgamma, Tensor& dbeta, float eps) {
+  const int T = x.dim(0);
+  const int C = x.dim(1);
+  Tensor dx({T, C});
+  for (int t = 0; t < T; ++t) {
+    const float* row = x.data() + t * C;
+    const float* dyr = dy.data() + t * C;
+    float* dxr = dx.data() + t * C;
+
+    float mean = 0.0f;
+    for (int c = 0; c < C; ++c) mean += row[c];
+    mean /= C;
+    float var = 0.0f;
+    for (int c = 0; c < C; ++c) {
+      const float d = row[c] - mean;
+      var += d * d;
+    }
+    var /= C;
+    const float rstd = 1.0f / std::sqrt(var + eps);
+
+    // xhat = (x - mean) * rstd ; y = gamma*xhat + beta
+    // dxhat = dy * gamma ; then the standard normalized-input backprop:
+    //   dx = rstd * (dxhat - mean(dxhat) - xhat * mean(dxhat * xhat))
+    float mean_dxhat = 0.0f, mean_dxhat_xhat = 0.0f;
+    for (int c = 0; c < C; ++c) {
+      const float xhat = (row[c] - mean) * rstd;
+      const float dxhat = dyr[c] * gamma[c];
+      mean_dxhat += dxhat;
+      mean_dxhat_xhat += dxhat * xhat;
+      dgamma[c] += dyr[c] * xhat;  // accumulate param grads
+      dbeta[c] += dyr[c];
+    }
+    mean_dxhat /= C;
+    mean_dxhat_xhat /= C;
+    for (int c = 0; c < C; ++c) {
+      const float xhat = (row[c] - mean) * rstd;
+      const float dxhat = dyr[c] * gamma[c];
+      dxr[c] = rstd * (dxhat - mean_dxhat - xhat * mean_dxhat_xhat);
+    }
+  }
+  return dx;
+}
+
+Tensor softmax_backward(const Tensor& y, const Tensor& dy) {
+  const int R = y.dim(0);
+  const int N = y.dim(1);
+  Tensor dx({R, N});
+  for (int r = 0; r < R; ++r) {
+    const float* yr = y.data() + r * N;
+    const float* dyr = dy.data() + r * N;
+    float* dxr = dx.data() + r * N;
+    float dot = 0.0f;
+    for (int j = 0; j < N; ++j) dot += dyr[j] * yr[j];
+    for (int j = 0; j < N; ++j) dxr[j] = yr[j] * (dyr[j] - dot);
+  }
+  return dx;
+}
+
 }  // namespace moo

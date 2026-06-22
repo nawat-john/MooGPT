@@ -93,11 +93,12 @@ GPT GPT::load(const std::string& path) {
   return m;
 }
 
-Tensor GPT::forward(const std::vector<int>& tokens) const {
+Tensor GPT::forward(const std::vector<int>& tokens) {
   const int T = static_cast<int>(tokens.size());
   const int C = cfg.n_embd;
   if (T == 0) die("forward: empty token sequence");
   if (T > cfg.block_size) die("forward: sequence longer than block_size");
+  tokens_ = tokens;
 
   // x = token embedding + positional embedding.
   Tensor x({T, C});
@@ -110,15 +111,104 @@ Tensor GPT::forward(const std::vector<int>& tokens) const {
     for (int c = 0; c < C; ++c) xr[c] = tok[c] + pos[c];
   }
 
-  for (const Block& blk : blocks) x = blk.forward(x);
-  x = layernorm(x, ln_f_w, ln_f_b);
+  for (Block& blk : blocks) x = blk.forward(x);
+  blocks_out_ = x;
+  lnf_out_ = layernorm(x, ln_f_w, ln_f_b);
 
   // Logits: (T, C) @ lm_head_w^T -> (T, vocab). No bias.
-  return linear(x, lm_head_w, Tensor());
+  return linear(lnf_out_, lm_head_w, Tensor());
+}
+
+void GPT::backward(const Tensor& dlogits) {
+  const int T = static_cast<int>(tokens_.size());
+  const int C = cfg.n_embd;
+
+  // lm_head (no bias): logits = lnf_out_ @ lm_head_w^T.
+  Tensor no_bias;
+  Tensor dx = linear_backward(lnf_out_, lm_head_w, dlogits, d_lm_head_w, no_bias);
+
+  // Final LayerNorm.
+  dx = layernorm_backward(blocks_out_, ln_f_w, dx, d_ln_f_w, d_ln_f_b);
+
+  // Transformer blocks, in reverse.
+  for (int l = static_cast<int>(blocks.size()) - 1; l >= 0; --l) {
+    dx = blocks[l].backward(dx);
+  }
+
+  // Embeddings: x[t] = wte[token[t]] + wpe[t], so the gradient at row t routes to both
+  // the token's embedding row and position t's embedding row (accumulated — a repeated
+  // token sums contributions across its positions).
+  for (int t = 0; t < T; ++t) {
+    const int id = tokens_[t];
+    const float* dxr = dx.data() + static_cast<std::size_t>(t) * C;
+    float* dwte = d_wte.data() + static_cast<std::size_t>(id) * C;
+    float* dwpe = d_wpe.data() + static_cast<std::size_t>(t) * C;
+    for (int c = 0; c < C; ++c) {
+      dwte[c] += dxr[c];
+      dwpe[c] += dxr[c];
+    }
+  }
+}
+
+void GPT::zero_grad() {
+  d_wte = Tensor(wte.shape());
+  d_wpe = Tensor(wpe.shape());
+  d_ln_f_w = Tensor(ln_f_w.shape());
+  d_ln_f_b = Tensor(ln_f_b.shape());
+  d_lm_head_w = Tensor(lm_head_w.shape());
+  for (Block& blk : blocks) blk.zero_grad();
+}
+
+std::vector<Tensor*> GPT::parameters() {
+  std::vector<Tensor*> p;
+  p.push_back(&wte);
+  p.push_back(&wpe);
+  for (Block& b : blocks) {
+    p.push_back(&b.ln_1_w);
+    p.push_back(&b.ln_1_b);
+    p.push_back(&b.attn.c_attn_w);
+    p.push_back(&b.attn.c_attn_b);
+    p.push_back(&b.attn.c_proj_w);
+    p.push_back(&b.attn.c_proj_b);
+    p.push_back(&b.ln_2_w);
+    p.push_back(&b.ln_2_b);
+    p.push_back(&b.mlp.c_fc_w);
+    p.push_back(&b.mlp.c_fc_b);
+    p.push_back(&b.mlp.c_proj_w);
+    p.push_back(&b.mlp.c_proj_b);
+  }
+  p.push_back(&ln_f_w);
+  p.push_back(&ln_f_b);
+  p.push_back(&lm_head_w);
+  return p;
+}
+
+std::vector<Tensor*> GPT::gradients() {
+  std::vector<Tensor*> g;
+  g.push_back(&d_wte);
+  g.push_back(&d_wpe);
+  for (Block& b : blocks) {
+    g.push_back(&b.d_ln_1_w);
+    g.push_back(&b.d_ln_1_b);
+    g.push_back(&b.attn.d_c_attn_w);
+    g.push_back(&b.attn.d_c_attn_b);
+    g.push_back(&b.attn.d_c_proj_w);
+    g.push_back(&b.attn.d_c_proj_b);
+    g.push_back(&b.d_ln_2_w);
+    g.push_back(&b.d_ln_2_b);
+    g.push_back(&b.mlp.d_c_fc_w);
+    g.push_back(&b.mlp.d_c_fc_b);
+    g.push_back(&b.mlp.d_c_proj_w);
+    g.push_back(&b.mlp.d_c_proj_b);
+  }
+  g.push_back(&d_ln_f_w);
+  g.push_back(&d_ln_f_b);
+  g.push_back(&d_lm_head_w);
+  return g;
 }
 
 std::vector<int> GPT::generate(const std::vector<int>& prompt, int max_new_tokens,
-                               float temperature, int top_k, std::mt19937& rng) const {
+                               float temperature, int top_k, std::mt19937& rng) {
   std::vector<int> seq = prompt;
   const int V = cfg.vocab_size;
 
