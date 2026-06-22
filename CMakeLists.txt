@@ -27,6 +27,10 @@ add_library(moocore
   src/ops.cpp
   src/tokenizer.cpp
   src/dataloader.cpp
+  src/attention.cpp
+  src/mlp.cpp
+  src/block.cpp
+  src/model.cpp
 )
 target_include_directories(moocore PUBLIC src)
 

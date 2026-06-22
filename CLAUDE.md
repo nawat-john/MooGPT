@@ -72,29 +72,55 @@ Work proceeds in phases (PROJECT_PLAN.md §5); each has a verification gate that
 
 **CMake is not installed on this machine** (checked Phase 0). `CMakeLists.txt` exists as the
 intended build, but builds are currently done directly with **g++ 14.2.0** at
-`C:\msys64\ucrt64\bin\g++.exe`. MSVC BuildTools 18 (`cl.exe`) is also present. From PowerShell,
-prepend the compiler to PATH first: `$env:Path = "C:\msys64\ucrt64\bin;$env:Path"`.
+`C:\msys64\ucrt64\bin\g++.exe`. MSVC BuildTools 18 (`cl.exe`) is also present. To compile, prepend
+the compiler to PATH: `$env:Path = "C:\msys64\ucrt64\bin;$env:Path"`.
+
+**Two PATH gotchas, both learned in Phase 2 — important:**
+1. **Build with `-static`.** Otherwise the exe depends on UCRT64 runtime DLLs and fails with
+   `0xC0000135` (DLL not found) unless `C:\msys64\ucrt64\bin` is on PATH at *run* time.
+2. **Do NOT have `ucrt64\bin` on PATH when running `python`.** msys ships its own `python.exe`
+   (no numpy/torch) that shadows the real interpreter at
+   `C:\Users\nawatpim\AppData\Local\Programs\Python\Python312\python.exe`. So: set the msys PATH
+   only for the g++ compile step; run the static exe and python from a clean shell.
 
 Build + run the test suites (each exits 0 = all checks passed):
 ```
-g++ -std=c++17 -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/ops.cpp tests/test_ops.cpp -o build/test_ops.exe
+g++ -std=c++17 -static -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/ops.cpp tests/test_ops.cpp -o build/test_ops.exe
 build/test_ops.exe        # Phase 0: tensor + ops
 
-g++ -std=c++17 -Wall -Wextra -Wpedantic -I src src/tokenizer.cpp src/dataloader.cpp tests/test_data.cpp -o build/test_data.exe
+g++ -std=c++17 -static -Wall -Wextra -Wpedantic -I src src/tokenizer.cpp src/dataloader.cpp tests/test_data.cpp -o build/test_data.exe
 build/test_data.exe       # Phase 1: tokenizer + dataloader
 ```
-Build + run the CLI (`train`/`generate`/`check` are stubs until later phases; `demo` works):
+Build the full CLI (`demo`/`check`/`generate` work; `train` is a Phase 4 stub):
 ```
-g++ -std=c++17 -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/ops.cpp src/main.cpp -o build/moogpt.exe
-build/moogpt.exe demo
+g++ -std=c++17 -O2 -static -I src src/tensor.cpp src/ops.cpp src/tokenizer.cpp src/dataloader.cpp \
+    src/attention.cpp src/mlp.cpp src/block.cpp src/model.cpp src/main.cpp -o build/moogpt.exe
 ```
 When new `.cpp` files land, add them to both the g++ command and the `moocore` library in
 `CMakeLists.txt`. Once CMake is installed, prefer `cmake -S . -B build && cmake --build build`
 then `ctest --test-dir build`.
 
-The test harness is dependency-free (no gtest/Catch): `tests/test_ops.cpp` counts checks and
-returns a non-zero exit code on any failure, so it gates cleanly. There is no single-test filter
-yet — add one (e.g. an argv name match) if the suite grows large.
+The C++ test harness is dependency-free (no gtest/Catch): each `tests/*.cpp` counts checks and
+returns a non-zero exit code on failure, so it gates cleanly. No single-test filter yet — add one
+(e.g. an argv name match) if a suite grows large.
+
+### Phase 2 verification gate (C++ forward vs PyTorch)
+
+PyTorch 2.12.1+cpu is installed (`pip install torch --index-url .../cpu`). Run the gate from a
+**clean shell** (no msys PATH tweak), after building `moogpt.exe`:
+```
+python reference/export_weights.py        # writes reference/artifacts/{weights,input,ref_logits}.bin
+build/moogpt.exe check reference/artifacts/weights.bin reference/artifacts/input.bin reference/artifacts/cpp_logits.bin
+python reference/check.py                  # PASS if max abs diff <= 1e-4 (currently ~6e-7)
+```
+`export_weights.py` takes `--n_layer/--n_head/--n_embd/--block_size/--vocab_size/--seqlen` to test
+other configs. The weight binary format (`MGPT` magic + int32 version + 5 int32 config + float32
+params in canonical order) is a contract defined identically in `export_weights.py::canonical_tensors`
+and `model.cpp::GPT::load` — changing the parameter set means editing **both** in lockstep.
+
+**Matching subtleties** (where two "correct" transformers diverge): exact erf GELU on both sides
+(not tanh), LayerNorm biased variance + eps 1e-5, `nn.Linear` weight layout `(out,in)`, explicit
+(non-fused) attention, fused-QKV split order `[Q|K|V]`, untied lm_head. See `docs/notes.md` Phase 2.
 
 ## Data plan (Phase 5)
 

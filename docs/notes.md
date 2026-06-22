@@ -133,6 +133,80 @@ within a row is `x[b,t+1] == x[b,t] + 1`. No need to track which start index was
 
 ---
 
+## Phase 2 — Forward Pass (inference)
+
+The whole transformer forward, fp32, single sequence `(T, C)`, batch=1. Matched against a
+PyTorch oracle to **max abs diff ~6e-7** (gate is 1e-4).
+
+### Architecture (must match `reference/model.py` exactly)
+
+```
+x = wte[tokens] + wpe[0..T-1]                      # (T, C)
+repeat N times:
+    x = x + attn(layernorm(x, ln_1))              # pre-norm + residual
+    x = x + mlp (layernorm(x, ln_2))
+x = layernorm(x, ln_f)
+logits = x @ lm_head^T                             # (T, vocab), no bias
+```
+
+### Things that must match bit-for-bit-ish across C++/PyTorch
+
+These are the subtle knobs where two "correct" transformers diverge past 1e-4:
+
+- **GELU variant.** Exact erf form `0.5 x (1 + erf(x/√2))` on both sides (`std::erf` in C++,
+  `F.gelu(..., approximate='none')` in torch). The tanh approximation would *not* match.
+- **LayerNorm:** biased variance (÷C, not ÷(C−1)), eps = 1e-5 — torch's defaults.
+- **Linear layout:** weight stored `(out, in)` like `nn.Linear`; `y = x @ Wᵀ + b`. Exporting
+  torch weights as-is then drops straight into the C++ `linear`.
+- **Attention written out explicitly** (matmul → scale by 1/√d → causal mask → softmax →
+  weighted sum of V) rather than a fused kernel, so it mirrors `attention.cpp` op-for-op.
+- **Fused QKV split order:** `c_attn` outputs `[Q | K | V]` along features; head h owns columns
+  `[h·d, (h+1)·d)` within each block. Same on both sides (nanoGPT convention).
+- **lm_head untied** from `wte` (separate weight) — simpler/explicit while bringing it up.
+
+### Scaled dot-product attention + causal mask
+
+`scores[i,j] = (q_i · k_j)/√d`; mask `j > i` to `-inf` so position i can only attend to
+≤ i (autoregressive); softmax each row; `out_i = Σ_j p[i,j] v_j`. The `-inf` entries become
+exactly 0 after softmax, so the C++ skips them (`j <= i`) — same result, less work.
+
+### Verification harness (the oracle)
+
+`reference/` is PyTorch, never linked into C++. Flow:
+
+1. `export_weights.py` — seed a model, write `weights.bin` (header + params in canonical
+   order), `input.bin` (token ids), and `ref_logits.bin` (torch forward output).
+2. `moogpt check weights.bin input.bin cpp_logits.bin` — C++ loads weights, runs forward,
+   dumps its logits.
+3. `check.py` — compares `ref_logits.bin` vs `cpp_logits.bin`, max abs diff vs tolerance.
+
+The binary format is the contract: `b"MGPT"`, int32 version, int32×5 config
+`(n_layer, n_head, n_embd, block_size, vocab_size)`, then float32 params in the **canonical
+order** defined identically in `export_weights.py::canonical_tensors` and
+`model.cpp::GPT::load`. The C++ loader checks magic/version and asserts no trailing bytes —
+a config/order mismatch surfaces immediately instead of as silent numeric garbage.
+
+### Sampling (generate)
+
+Take the last position's logits, divide by temperature, optional top-k (keep k largest via
+`nth_element`, mask the rest to −inf), softmax, sample with `std::discrete_distribution`.
+Context is cropped to the last `block_size` tokens each step.
+
+### Gotchas / decisions
+
+- **Static linking required to run the exe.** A plain g++ build depends on UCRT64 runtime
+  DLLs (`libstdc++-6`, `libgcc_s_seh-1`, `libwinpthread-1`); running it without
+  `C:\msys64\ucrt64\bin` on PATH fails with `0xC0000135` (DLL not found). Build with
+  `-static` so the binary is self-contained.
+- **Don't prepend `ucrt64\bin` to PATH when invoking `python`** — msys ships its own
+  `python.exe` (no numpy/torch) and it shadows the real interpreter. Build C++ statically,
+  then run python from a clean PATH. (This is why the gate is run in a shell *without* the
+  msys PATH tweak.)
+- Tolerance reality: max **abs** diff ~1e-6; max **rel** diff can be ~1e-3–1e-2 where a logit
+  is near zero — abs diff is the meaningful gate for logits.
+
+---
+
 ## Build environment (this machine)
 
 CMake is **not** installed. Two compilers are present:

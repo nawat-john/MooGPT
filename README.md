@@ -60,7 +60,7 @@ Early/planning stage. The repository currently contains the design document
 |---|---|---|
 | **P0** ✅ | Tensor + matmul + unit tests | Tests green; hand-checked matmul correct |
 | **P1** ✅ | Char tokenizer + dataloader | `decode(encode(x))==x`; batches shaped right |
-| **P2** | Forward pass (inference) | C++ logits match PyTorch within ~1e-4 |
+| **P2** ✅ | Forward pass (inference) | C++ logits match PyTorch within ~1e-4 |
 | **P3** | Loss + backprop | All gradients pass finite-diff **and** autograd checks |
 | **P4** | AdamW + training loop | Single-batch loss → ~0; real loss decreases |
 | **P5** | Conversational persona | Holds a cute, clean `<user>`/`<bot>` conversation |

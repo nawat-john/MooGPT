@@ -47,6 +47,7 @@ data/raw/
 data/cache/
 checkpoints/
 weights/
+reference/artifacts/
 *.log
 
 # ---- Editors / OS ----
