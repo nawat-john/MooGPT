@@ -227,8 +227,8 @@ forward and its backward match the reference.**
 
 ## 8. Milestone Checklist
 
-- [ ] P0: Tensor + matmul + tests green
-- [ ] P1: tokenizer round-trips; batches correct
+- [x] P0: Tensor + matmul + tests green
+- [x] P1: tokenizer round-trips; batches correct
 - [ ] P2: C++ forward logits == PyTorch (random weights loaded)
 - [ ] P3: all gradients pass finite-diff **and** autograd checks
 - [ ] P4: single-batch loss → ~0; real training loss decreasing; word-like samples

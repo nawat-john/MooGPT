@@ -70,9 +70,31 @@ Work proceeds in phases (PROJECT_PLAN.md §5); each has a verification gate that
 
 ## Build & run
 
-No build system exists yet — CMake is planned but not written. Once scaffolded, document the
-actual `cmake`/`ctest` invocations and the `main` subcommands (`train`/`generate`/`check`) here.
-Do not invent commands before the build files exist.
+**CMake is not installed on this machine** (checked Phase 0). `CMakeLists.txt` exists as the
+intended build, but builds are currently done directly with **g++ 14.2.0** at
+`C:\msys64\ucrt64\bin\g++.exe`. MSVC BuildTools 18 (`cl.exe`) is also present. From PowerShell,
+prepend the compiler to PATH first: `$env:Path = "C:\msys64\ucrt64\bin;$env:Path"`.
+
+Build + run the test suites (each exits 0 = all checks passed):
+```
+g++ -std=c++17 -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/ops.cpp tests/test_ops.cpp -o build/test_ops.exe
+build/test_ops.exe        # Phase 0: tensor + ops
+
+g++ -std=c++17 -Wall -Wextra -Wpedantic -I src src/tokenizer.cpp src/dataloader.cpp tests/test_data.cpp -o build/test_data.exe
+build/test_data.exe       # Phase 1: tokenizer + dataloader
+```
+Build + run the CLI (`train`/`generate`/`check` are stubs until later phases; `demo` works):
+```
+g++ -std=c++17 -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/ops.cpp src/main.cpp -o build/moogpt.exe
+build/moogpt.exe demo
+```
+When new `.cpp` files land, add them to both the g++ command and the `moocore` library in
+`CMakeLists.txt`. Once CMake is installed, prefer `cmake -S . -B build && cmake --build build`
+then `ctest --test-dir build`.
+
+The test harness is dependency-free (no gtest/Catch): `tests/test_ops.cpp` counts checks and
+returns a non-zero exit code on any failure, so it gates cleanly. There is no single-test filter
+yet — add one (e.g. an argv name match) if the suite grows large.
 
 ## Data plan (Phase 5)
 

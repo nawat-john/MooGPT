@@ -58,8 +58,8 @@ Early/planning stage. The repository currently contains the design document
 
 | Phase | Goal | Gate |
 |---|---|---|
-| **P0** | Tensor + matmul + unit tests | Tests green; hand-checked matmul correct |
-| **P1** | Char tokenizer + dataloader | `decode(encode(x))==x`; batches shaped right |
+| **P0** ✅ | Tensor + matmul + unit tests | Tests green; hand-checked matmul correct |
+| **P1** ✅ | Char tokenizer + dataloader | `decode(encode(x))==x`; batches shaped right |
 | **P2** | Forward pass (inference) | C++ logits match PyTorch within ~1e-4 |
 | **P3** | Loss + backprop | All gradients pass finite-diff **and** autograd checks |
 | **P4** | AdamW + training loop | Single-batch loss → ~0; real loss decreases |
@@ -81,8 +81,24 @@ docs/       notes.md — math derivations and learnings
 
 ## Building
 
-The CMake build is not yet scaffolded. Build and run instructions will be added here once `src/`
-and `CMakeLists.txt` exist.
+A `CMakeLists.txt` is provided. With CMake installed:
+
+```
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+If CMake isn't available, build directly with a C++17 compiler (e.g. g++):
+
+```
+g++ -std=c++17 -Wall -Wextra -Wpedantic -I src \
+    src/tensor.cpp src/ops.cpp tests/test_ops.cpp -o build/test_ops.exe
+build/test_ops.exe        # exit 0 = all checks passed
+
+g++ -std=c++17 -I src src/tensor.cpp src/ops.cpp src/main.cpp -o build/moogpt.exe
+build/moogpt.exe demo     # hand-checked matmul demo
+```
 
 ## License
 
