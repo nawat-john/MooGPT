@@ -1,0 +1,57 @@
+# ---- C/C++ build artifacts ----
+build/
+out/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+compile_commands.json
+
+# ---- CUDA (Phase 6, stretch) ----
+*.cubin
+*.ptx
+*.fatbin
+
+# ---- Python (reference/ and data/ scripts) ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.Python
+*.egg-info/
+.ipynb_checkpoints/
+
+# ---- Model weights & data artifacts ----
+# Exported/checkpoint binaries and large corpora — keep out of git.
+*.bin
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.npy
+*.npz
+data/*.txt
+data/raw/
+data/cache/
+checkpoints/
+weights/
+*.log
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
