@@ -52,8 +52,18 @@ class GPT {
   std::vector<int> generate(const std::vector<int>& prompt, int max_new_tokens,
                             float temperature, int top_k, std::mt19937& rng);
 
+  // Build a fresh model with random weights (Phase 4 training from scratch). Uses the
+  // GPT-2 init recipe: normal(0, 0.02) for embeddings and linear weights, zeros for
+  // biases, ones for LayerNorm gains; residual projections (the two c_proj weights) get
+  // the 1/sqrt(2*n_layer) scaling so the residual stream doesn't grow with depth.
+  static GPT random_init(const GPTConfig& cfg, std::mt19937& rng);
+
   // Load weights from a flat binary written by reference/export_weights.py.
   static GPT load(const std::string& path);
+
+  // Write the model to the same flat MGPT binary that load() reads (header + params in
+  // canonical order), so a trained checkpoint can be reloaded for generation.
+  void save(const std::string& path);
 
  private:
   std::vector<int> tokens_;  // cached input ids

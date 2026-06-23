@@ -93,11 +93,14 @@ build/test_data.exe       # Phase 1: tokenizer + dataloader
 
 g++ -std=c++17 -static -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/ops.cpp src/loss.cpp tests/test_grad.cpp -o build/test_grad.exe
 build/test_grad.exe       # Phase 3: finite-difference gradient checks
+
+g++ -std=c++17 -static -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/optimizer.cpp tests/test_optim.cpp -o build/test_optim.exe
+build/test_optim.exe      # Phase 4: AdamW (convex minimization + weight-decay behavior)
 ```
-Build the full CLI (`demo`/`check`/`grads`/`generate` work; `train` is a Phase 4 stub):
+Build the full CLI (`demo`/`check`/`grads`/`generate`/`train` all work):
 ```
 g++ -std=c++17 -O2 -static -I src src/tensor.cpp src/ops.cpp src/tokenizer.cpp src/dataloader.cpp \
-    src/attention.cpp src/mlp.cpp src/block.cpp src/model.cpp src/loss.cpp src/main.cpp -o build/moogpt.exe
+    src/attention.cpp src/mlp.cpp src/block.cpp src/model.cpp src/loss.cpp src/optimizer.cpp src/main.cpp -o build/moogpt.exe
 ```
 When new `.cpp` files land, add them to both the g++ command and the `moocore` library in
 `CMakeLists.txt`. Once CMake is installed, prefer `cmake -S . -B build && cmake --build build`
@@ -139,6 +142,25 @@ grad buffers, so `model.zero_grad()` must run before `model.backward()`. `forwar
 (it caches activations); `parameters()`/`gradients()` expose the canonical-order tensors that both
 the grad file format and the FD check rely on. Derivations for every op (incl. the attention
 backward) are in `docs/notes.md` Phase 3.
+
+### Phase 4 verification gate (training, no PyTorch needed)
+
+Two parts. (1) The single-batch overfit sanity check — proves the forward→loss→backward→step→
+zero_grad loop is wired:
+```
+build/moogpt.exe train data/tiny.txt --overfit --steps 500 --batch 4 --block 32 --lr 1e-3
+# loss must collapse toward ~0 (observed 3.36 -> ~0.03); --overfit forces weight_decay=0
+```
+(2) Real training — full-corpus loss decreases steadily and decoded samples become word-like:
+```
+build/moogpt.exe train data/tiny.txt --steps 3000 --batch 16 --block 64 --lr 1e-3
+```
+Plus `build/test_optim.exe` (AdamW convex-minimization + decay behavior, dependency-free).
+`train` flags: `--steps/--batch/--block/--layer/--head/--embd/--lr/--wd/--seed/--out/--overfit`;
+the trained model is saved in the same MGPT format `load`/`generate` read. `data/tiny.txt` is a
+small public-domain child-voice corpus. AdamW only weight-decays 2-D+ params (matrices/embeddings),
+not biases/LayerNorm. Batch=1 model: train loops the B rows, scaling each row's `dlogits` by 1/B so
+accumulation yields the mean-loss gradient. Derivations in `docs/notes.md` Phase 4.
 
 ## Data plan (Phase 5)
 

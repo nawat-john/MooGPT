@@ -309,6 +309,88 @@ attn). At the top, the embedding gradient routes the per-position `dx[t]` into *
 
 ---
 
+## Phase 4 — Optimizer & Training Loop
+
+AdamW from scratch + the training loop that drives forward → loss → backward → step →
+zero_grad. Verified two ways: a self-contained `test_optim` (convex minimization +
+weight-decay behavior, no PyTorch) and the plan's two-part training gate.
+
+### AdamW
+
+Adam keeps two running averages per parameter — the first moment `m` (mean gradient) and
+the second moment `v` (mean squared gradient):
+```
+m = β1·m + (1−β1)·g
+v = β2·v + (1−β2)·g²
+```
+Both start at 0, so early on they're biased toward 0. Bias correction divides them back
+out (each divisor → 1 as t grows):
+```
+m̂ = m / (1 − β1^t)     v̂ = v / (1 − β2^t)
+θ ← θ − lr · m̂ / (√v̂ + eps)
+```
+`m̂/√v̂` is a per-parameter adaptive step: directions with consistently large/noisy
+gradients get smaller effective steps. Defaults β1=0.9, β2=0.999, eps=1e-8.
+
+**The "W": decoupled weight decay.** Plain Adam adds L2 (`+wd·θ`) into `g`, which then runs
+through the adaptive `/√v̂` denominator — so it is *not* uniform decay. AdamW instead
+shrinks the parameter directly, independent of the moments:
+```
+θ ← θ − lr·wd·θ      (applied before the Adam step)
+```
+Per the GPT-2 convention we **only decay 2-D+ tensors** (weight matrices, embeddings), not
+biases or LayerNorm gains/shifts — the optimizer keys this off `param.ndim() >= 2`.
+`test_optim` checks all three behaviors: convex problems converge to the true optimum, a
+matrix with zero grad decays as `(1−lr·wd)^t`, and a 1-D param with zero grad is untouched.
+
+### Batching with a batch=1 model
+
+`forward()`/`backward()` run one sequence at a time. To train on a `(B, T)` batch we loop
+the B rows: forward, cross-entropy (which already averages over T), then **scale that row's
+`dlogits` by 1/B** before `backward()`. Because backward *accumulates* into the grad
+buffers, summing B rows each scaled by 1/B yields exactly the gradient of the mean loss
+over the batch. `zero_grad()` runs once before the row loop, `opt.step()` once after.
+
+### Initialization (training from scratch)
+
+Until now parameters only ever came from `GPT::load`. `GPT::random_init` adds the GPT-2
+recipe: `normal(0, 0.02)` for embeddings and linear weights, zeros for biases, ones for
+LayerNorm gains. The two residual projections (`attn.c_proj`, `mlp.c_proj`) instead use
+`0.02/√(2·n_layer)` — each block writes two residual contributions, so over n_layer blocks
+the stream accumulates `2·n_layer` of them; this scaling keeps its variance ~constant with
+depth (otherwise deep models blow up at init).
+
+### LR schedule
+
+Linear warmup (0 → lr over a few % of steps) then half-cosine decay to `0.1·lr`. Warmup
+avoids the large, badly-conditioned early steps when Adam's `v` estimate is still noisy;
+cosine decay anneals to fine-tune near the end. The overfit sanity run uses a constant lr.
+
+### Verification gate (two parts)
+
+1. **Overfit a single fixed batch** — `train --overfit` reuses one batch every step. Loss
+   must collapse toward ~0; this proves the loop is wired (any break — a sign error, a
+   missing `zero_grad`, a transposed grad — leaves loss stuck). Observed: 3.36 → ~0.03 in
+   500 steps on `data/tiny.txt`. Weight decay is forced to 0 here (it would fight reaching 0).
+2. **Real training** — full-corpus loss decreases steadily and decoded samples become
+   word-like (spaces in sensible places, real short words, line breaks). `data/tiny.txt`
+   is a small public-domain child-voice corpus (nursery rhymes / simple sentences) that
+   suits both the char-level model and the eventual persona.
+
+### Gotchas / decisions
+
+- **Captured pointer stability.** `AdamW` stores the `parameters()` pointers and `step()`
+  takes the `gradients()` pointers; both are addresses of GPT *member* tensors, which stay
+  fixed even though `zero_grad()` reallocates the underlying grad buffers each step. So
+  capturing them once is safe.
+- **Checkpoint = the MGPT format.** `GPT::save` writes the exact header+canonical-order
+  binary that `load` reads, so a trained model round-trips back in for `generate`. Loss is
+  accumulated in `double` across the batch for a stable scalar.
+- Speed is still last priority: one sequence at a time, naive loops. Fine for the tiny
+  char model; Phase 6 is where this gets optimized.
+
+---
+
 ## Build environment (this machine)
 
 CMake is **not** installed. Two compilers are present:

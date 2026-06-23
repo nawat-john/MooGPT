@@ -36,6 +36,21 @@ int32_t read_i32(std::ifstream& f) {
   return v;
 }
 
+// Fill a tensor with i.i.d. normal(0, std) noise (Gaussian init).
+void fill_normal(Tensor& t, float std, std::mt19937& rng) {
+  std::normal_distribution<float> dist(0.0f, std);
+  for (std::size_t i = 0; i < t.size(); ++i) t[i] = dist(rng);
+}
+
+void write_i32(std::ofstream& f, int32_t v) {
+  f.write(reinterpret_cast<const char*>(&v), sizeof(v));
+}
+
+void write_tensor(std::ofstream& f, const Tensor& t) {
+  f.write(reinterpret_cast<const char*>(t.data()),
+          static_cast<std::streamsize>(t.size() * sizeof(float)));
+}
+
 }  // namespace
 
 GPT GPT::load(const std::string& path) {
@@ -91,6 +106,71 @@ GPT GPT::load(const std::string& path) {
   f.peek();
   if (!f.eof()) die("trailing bytes in weight file (config/order mismatch?)");
   return m;
+}
+
+GPT GPT::random_init(const GPTConfig& cfg, std::mt19937& rng) {
+  GPT m;
+  m.cfg = cfg;
+  const int C = cfg.n_embd;
+  const int V = cfg.vocab_size;
+  const int B = cfg.block_size;
+  const float std0 = 0.02f;
+  // Residual-projection scaling: each block adds two residual contributions (attn, mlp),
+  // so over n_layer blocks the stream accumulates 2*n_layer of them. Scaling the c_proj
+  // weights by 1/sqrt(2*n_layer) keeps the output variance roughly constant with depth.
+  const float std_proj = 0.02f / std::sqrt(2.0f * static_cast<float>(cfg.n_layer));
+
+  m.wte = Tensor({V, C});
+  fill_normal(m.wte, std0, rng);
+  m.wpe = Tensor({B, C});
+  fill_normal(m.wpe, std0, rng);
+
+  m.blocks.resize(cfg.n_layer);
+  for (auto& blk : m.blocks) {
+    blk.cfg = cfg;
+    blk.attn.cfg = cfg;
+    blk.mlp.cfg = cfg;
+
+    blk.ln_1_w = Tensor({C});
+    blk.ln_1_w.fill(1.0f);
+    blk.ln_1_b = Tensor({C});  // zeros
+    blk.attn.c_attn_w = Tensor({3 * C, C});
+    fill_normal(blk.attn.c_attn_w, std0, rng);
+    blk.attn.c_attn_b = Tensor({3 * C});
+    blk.attn.c_proj_w = Tensor({C, C});
+    fill_normal(blk.attn.c_proj_w, std_proj, rng);
+    blk.attn.c_proj_b = Tensor({C});
+    blk.ln_2_w = Tensor({C});
+    blk.ln_2_w.fill(1.0f);
+    blk.ln_2_b = Tensor({C});
+    blk.mlp.c_fc_w = Tensor({4 * C, C});
+    fill_normal(blk.mlp.c_fc_w, std0, rng);
+    blk.mlp.c_fc_b = Tensor({4 * C});
+    blk.mlp.c_proj_w = Tensor({C, 4 * C});
+    fill_normal(blk.mlp.c_proj_w, std_proj, rng);
+    blk.mlp.c_proj_b = Tensor({C});
+  }
+
+  m.ln_f_w = Tensor({C});
+  m.ln_f_w.fill(1.0f);
+  m.ln_f_b = Tensor({C});
+  m.lm_head_w = Tensor({V, C});
+  fill_normal(m.lm_head_w, std0, rng);
+  return m;
+}
+
+void GPT::save(const std::string& path) {
+  std::ofstream f(path, std::ios::binary);
+  if (!f) die("cannot open file for writing: " + path);
+  f.write("MGPT", 4);
+  write_i32(f, 1);  // version
+  write_i32(f, cfg.n_layer);
+  write_i32(f, cfg.n_head);
+  write_i32(f, cfg.n_embd);
+  write_i32(f, cfg.block_size);
+  write_i32(f, cfg.vocab_size);
+  // parameters() yields tensors in the canonical order load() expects.
+  for (const Tensor* p : parameters()) write_tensor(f, *p);
 }
 
 Tensor GPT::forward(const std::vector<int>& tokens) {

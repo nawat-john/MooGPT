@@ -43,6 +43,8 @@ env/
 *.npy
 *.npz
 data/*.txt
+# curated sample corpus, small & on-theme — keep tracked for the P4 gate
+!data/tiny.txt
 data/raw/
 data/cache/
 checkpoints/

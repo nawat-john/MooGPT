@@ -231,7 +231,7 @@ forward and its backward match the reference.**
 - [x] P1: tokenizer round-trips; batches correct
 - [x] P2: C++ forward logits == PyTorch (random weights loaded)
 - [x] P3: all gradients pass finite-diff **and** autograd checks
-- [ ] P4: single-batch loss → ~0; real training loss decreasing; word-like samples
+- [x] P4: single-batch loss → ~0; real training loss decreasing; word-like samples
 - [ ] P5: persona model holds a basic, cute, clean conversation
 - [ ] P6 (stretch): GPU path matches CPU path
 
