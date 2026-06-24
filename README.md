@@ -28,8 +28,8 @@ token + learned positional embeddings
 ```
 
 - **Precision:** fp32 everywhere (easiest to reason about).
-- **Compute:** CPU-first with naive loops, then OpenMP multi-core parallelism (Phase 6);
-  GPU/CUDA is a further optional phase.
+- **Compute:** CPU-first with naive loops, then OpenMP multi-core parallelism (~4.1× on 16 cores,
+  Phase 6a), plus an optional, verified GPU/CUDA forward path on an RTX 3050 (Phase 6b).
 - **Tokenizer:** char-level (Phases 0–4), then a from-scratch byte-level BPE with role tokens
   (`<user>`/`<bot>`/`<eot>`) for the Phase 5 chat model.
 
@@ -53,8 +53,9 @@ gradient checks so correctness doesn't depend on having PyTorch available.
 
 ## Project status
 
-Phases 0–5 are complete; Phase 6 (GPU) is an optional stretch goal. The model trains end to end
-and the Phase 5 `chat` command holds a short, on-tone, clean conversation as Moo.
+All phases are complete, including the Phase 6 stretch goals: CPU OpenMP parallelism (~4.1× on
+16 cores) and a verified GPU/CUDA forward path on an RTX 3050. The model trains end to end and the
+Phase 5 `chat` command holds a short, on-tone, clean conversation as Moo.
 
 ### Roadmap
 
@@ -66,7 +67,8 @@ and the Phase 5 `chat` command holds a short, on-tone, clean conversation as Moo
 | **P3** ✅ | Loss + backprop | All gradients pass finite-diff **and** autograd checks |
 | **P4** ✅ | AdamW + training loop | Single-batch loss → ~0; real loss decreases; word-like samples |
 | **P5** ✅ | Conversational persona | BPE + role tokens; holds a cute, clean `<user>`/`<bot>` chat |
-| **P6** ◐ | Performance & GPU *(stretch)* | CPU: OpenMP parallelism, ~3.7× on 16 cores, gates unchanged ✅. GPU/CUDA: pending toolkit |
+| **P6a** ✅ | Performance: CPU OpenMP *(stretch)* | matmul/linear + attention (`H*T`-way) parallelized; ~4.1× on 16 cores, gates unchanged |
+| **P6b** ✅ | GPU/CUDA forward *(stretch)* | hand-written kernels on RTX 3050 (CUDA 12.8); logits match CPU/PyTorch ~5e-7 (inference only) |
 
 See [`PROJECT_PLAN.md`](PROJECT_PLAN.md) for the full design, data plan, and learning resources,
 and [`docs/notes.md`](docs/notes.md) for the per-phase math derivations.
@@ -104,9 +106,13 @@ g++ -std=c++17 -O2 -fopenmp -static -I src \
 build/moogpt.exe demo     # hand-checked matmul demo
 ```
 
-`-fopenmp` enables the Phase 6 multi-core speedup (matmul / linear / attention parallelized,
-~3.7× on 16 cores); it's optional — without it the build is the identical serial CPU path.
-`OMP_NUM_THREADS` controls the thread count at run time.
+`-fopenmp` enables the Phase 6a multi-core speedup (matmul / linear over output rows, attention
+over the flattened `(head, query-row)` space; ~4.1× on 16 cores); it's optional — without it the
+build is the identical serial CPU path. `OMP_NUM_THREADS` controls the thread count at run time.
+
+The optional Phase 6b GPU forward path is a single file, `src/forward_cuda.cu`, built with `nvcc`
+and verified against the same PyTorch oracle (`reference/check.py`). See [`CLAUDE.md`](CLAUDE.md)
+Phase 6b for the exact build (CUDA 12.8, `-arch=sm_86`) and toolchain notes.
 
 Each test suite is a standalone target that exits 0 when all checks pass — see
 [`CLAUDE.md`](CLAUDE.md) for the per-suite build/run commands and the PyTorch verification gates.
@@ -126,6 +132,21 @@ build/moogpt.exe train data/persona.clean.txt --bpe --vocab 1024 \
 build/moogpt.exe chat build/moo.bin build/moo.bin.bpe "hi! how are you?"
 build/moogpt.exe chat build/moo.bin build/moo.bin.bpe     # interactive (empty line to quit)
 ```
+
+Sample replies from the trained model:
+
+```
+you> hello!
+moo> hello hello! what a sweet day to say hi!
+you> what is your name?
+moo> my name is moo! i am a little friend. what is your name?
+you> tell me a story
+moo> okay! once a little sat on a cozy little nest and watched the stars. then it had
+     a happy nap. the end! did you like it?
+```
+
+Voice, format, and safety are rock-solid; topic-matching is hit-or-miss (expected of a ~3M-param
+model at 1500 steps) — a "train longer / bigger" lever, not a correctness gap.
 
 Moo's whole personality lives in the data: [`data/PERSONA.md`](data/PERSONA.md) locks the character,
 the exact `<user> …<eot><bot> …<eot>` format, and the generation prompt. `generate_dialogues.py`
