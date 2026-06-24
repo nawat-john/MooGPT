@@ -96,10 +96,13 @@ build/test_grad.exe       # Phase 3: finite-difference gradient checks
 
 g++ -std=c++17 -static -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/optimizer.cpp tests/test_optim.cpp -o build/test_optim.exe
 build/test_optim.exe      # Phase 4: AdamW (convex minimization + weight-decay behavior)
+
+g++ -std=c++17 -static -Wall -Wextra -Wpedantic -I src src/bpe.cpp tests/test_bpe.cpp -o build/test_bpe.exe
+build/test_bpe.exe        # Phase 5: BPE round-trip, special tokens, determinism, save/load
 ```
-Build the full CLI (`demo`/`check`/`grads`/`generate`/`train` all work):
+Build the full CLI (`demo`/`check`/`grads`/`generate`/`train`/`chat` all work):
 ```
-g++ -std=c++17 -O2 -static -I src src/tensor.cpp src/ops.cpp src/tokenizer.cpp src/dataloader.cpp \
+g++ -std=c++17 -O2 -static -I src src/tensor.cpp src/ops.cpp src/tokenizer.cpp src/bpe.cpp src/dataloader.cpp \
     src/attention.cpp src/mlp.cpp src/block.cpp src/model.cpp src/loss.cpp src/optimizer.cpp src/main.cpp -o build/moogpt.exe
 ```
 When new `.cpp` files land, add them to both the g++ command and the `moocore` library in

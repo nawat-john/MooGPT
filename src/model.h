@@ -48,9 +48,12 @@ class GPT {
   std::vector<Tensor*> gradients();
 
   // Autoregressive sampling (see generate()): temperature > 0 scales logits;
-  // top_k <= 0 disables top-k filtering.
+  // top_k <= 0 disables top-k filtering. If stop_id >= 0, generation halts right after
+  // that token is sampled (used by chat to stop at <eot>); the returned sequence includes
+  // the prompt plus all generated tokens (including the stop token if it was hit).
   std::vector<int> generate(const std::vector<int>& prompt, int max_new_tokens,
-                            float temperature, int top_k, std::mt19937& rng);
+                            float temperature, int top_k, std::mt19937& rng,
+                            int stop_id = -1);
 
   // Build a fresh model with random weights (Phase 4 training from scratch). Uses the
   // GPT-2 init recipe: normal(0, 0.02) for embeddings and linear weights, zeros for

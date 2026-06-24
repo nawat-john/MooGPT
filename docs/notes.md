@@ -391,6 +391,95 @@ cosine decay anneals to fine-tune near the end. The overfit sanity run uses a co
 
 ---
 
+## Phase 5 — The Conversational Character
+
+Adds a from-scratch byte-level BPE tokenizer with role tokens, a conversation data format,
+and a chat loop, then trains the child-like persona model.
+
+### Byte-level BPE (`bpe.{h,cpp}`)
+
+BPE = Byte-Pair Encoding. Start from the 256 raw byte values and repeatedly **merge the
+most frequent adjacent token pair** into a new token, growing the vocab to a target size.
+Encoding then replays those merges (lowest-rank/earliest-learned first) on each piece of
+input; decoding concatenates each token's stored bytes.
+
+- **Byte-level ⇒ always round-trips.** The base alphabet is all 256 bytes, so any input —
+  unseen characters, raw binary, UTF-8 multibyte — encodes and decodes exactly. No `<unk>`.
+  `test_bpe` fuzzes 500 random byte strings through `decode(encode(x)) == x`.
+- **Pre-tokenization into byte-class "words."** Before training, text is split into maximal
+  runs of one class (letters / digits / whitespace / other) and merges never cross a word
+  boundary. This keeps merges meaningful (no token spanning a space into the next word) and
+  makes training fast: we count pairs over the *unique* words weighted by frequency, and
+  apply each merge only within words — orders of magnitude less work than scanning the whole
+  corpus per merge.
+- **Determinism.** Pair counts live in an ordered `std::map`; ties go to the smallest
+  `(a,b)`. Same corpus ⇒ identical merges (checked in `test_bpe`).
+- **Special / role tokens.** `<user>`, `<bot>`, `<eot>` are reserved strings given ids
+  *after* the byte+merge vocab. `encode` splits them out first (longest-match), emits their
+  id atomically, and BPE-encodes only the text between — so a role token is always exactly
+  one token and can reliably delimit turns. They're also excluded from merge training.
+- **Vocab id layout:** `[0,256)` bytes, `[256, 256+#merges)` merges, then the specials.
+  `vocab_size()` includes the specials; the model's `cfg.vocab_size` is set from it.
+- Save/load is a small text format (`MOOBPE 1`, the ordered merge pairs, the special
+  strings); the vocab is rebuilt from the merges on load.
+
+### Conversation format & chat loop
+
+Canonical turn format (locked in `data/PERSONA.md`):
+```
+<user> {message}<eot><bot> {reply}<eot>
+```
+Training is plain next-token LM over the concatenated token stream — the DataLoader and GPT
+from Phases 1–4 are unchanged; only the tokenizer differs (`train --bpe`). The model learns
+to emit `<bot> …<eot>` after a `<user> …<eot>`. `chat` prompts with everything up to and
+including the `<bot>` token, then samples until `<eot>` (the new `stop_id` in `generate`),
+and decodes the span in between as the reply.
+
+### Persona data (the voice)
+
+The personality is entirely in the data. `data/PERSONA.md` locks the character ("Moo": sweet,
+child-like, simple words, honest about not knowing, never unsafe), the exact format, and the
+generation system prompt. `data/persona_seed.txt` is a hand-written seed (~45 dialogues) that
+defines the format and wires/tests the pipeline.
+
+The bulk corpus is produced by `data/generate_dialogues.py` → `data/persona.txt`. PROJECT_PLAN
+§6 envisioned generating this layer with an LLM API; the script is instead a **dependency-free,
+deterministic template generator** — it composes dialogues from curated per-topic templates with
+slot fillers (animals, colors, foods, numbers, weather, the honest "hmm... i'm not sure"
+pattern for unknowns, …), mixing single- and multi-turn (1–4 turns). This keeps Moo's voice
+locked, needs no API key or network, and reproduces exactly from `--seed`. Trade-off: less
+lexical variety than a real LLM would give, but for a tiny model trained to *adopt a consistent
+voice* that's a feature — and the API path stays documented in PERSONA.md for a richer run.
+Default run is ~8k dialogues (seed + generated, exact duplicates skipped). `data/safety_filter.py`
+is the final keyword pass over the corpus (it drops 0 here — the generator is clean by
+construction, which is exactly the check we want).
+
+### Verification gate
+
+Qualitative: a `<user>` turn yields a `<bot>` reply that is on-topic-enough, in the sweet
+child-like voice, and clean. Plus `test_bpe` (round-trip / specials / determinism / save-load)
+gates the tokenizer mechanically before any training.
+
+**Result (the run that closed the gate).** `train data/persona.clean.txt --bpe --vocab 1024
+--steps 1500 --batch 16 --block 64 --lr 1e-3` on the ~8k-dialogue corpus: BPE saturated at
+vocab=1018 (256 bytes + 759 merges + 3 specials), 798k training tokens; loss 6.90 → ~0.27 in
+1500 steps (~40 min on CPU, naive loops). `chat` over a dozen varied prompts gives clean,
+correctly-formatted, on-voice Moo replies — most on-topic (name, counting, comfort, goodbyes,
+storytelling all land), with a few topic mismatches expected of a ~3M-param model at this step
+budget (e.g. "favorite animal" can draw the arithmetic reply). Voice consistency and safety are
+solid; sharper topic-matching is a "train longer / bigger" lever, not a correctness gap. The
+checkpoint round-trips through `save`/`load` and `chat` reads it back via the `.bpe` sidecar.
+
+### Gotchas / decisions
+
+- The space after `<user>`/`<bot>` is part of the format and becomes its own token; the chat
+  prompt ends at the `<bot>` token (no trailing space) and lets the model generate the
+  leading space, matching how the data was tokenized.
+- Char-level (`Tokenizer`) is kept for Phases 0–4; BPE is additive (`--bpe`), not a
+  replacement, so the older gates still run unchanged.
+
+---
+
 ## Build environment (this machine)
 
 CMake is **not** installed. Two compilers are present:

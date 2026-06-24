@@ -26,6 +26,7 @@ add_library(moocore
   src/tensor.cpp
   src/ops.cpp
   src/tokenizer.cpp
+  src/bpe.cpp
   src/dataloader.cpp
   src/attention.cpp
   src/mlp.cpp
@@ -58,3 +59,7 @@ add_test(NAME test_grad COMMAND test_grad)
 add_executable(test_optim tests/test_optim.cpp)
 target_link_libraries(test_optim PRIVATE moocore)
 add_test(NAME test_optim COMMAND test_optim)
+
+add_executable(test_bpe tests/test_bpe.cpp)
+target_link_libraries(test_bpe PRIVATE moocore)
+add_test(NAME test_bpe COMMAND test_bpe)

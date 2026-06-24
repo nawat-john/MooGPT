@@ -9,12 +9,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <random>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include "bpe.h"
 #include "dataloader.h"
 #include "loss.h"
 #include "model.h"
@@ -32,8 +34,9 @@ int usage(const char* argv0) {
             << "  check <weights> <input> <out_logits>   forward pass; dump logits\n"
             << "  grads <weights> <input> <targets> <out>  forward+loss+backward; dump grads\n"
             << "  generate <weights> <n> [temp] [top_k]  sample n tokens from id 0\n"
-            << "  train <data.txt> [flags]               train a model (see --overfit,\n"
-            << "                                         --steps/--batch/--block/--lr/...)\n";
+            << "  train <data.txt> [flags]               train a model (--bpe for Phase 5;\n"
+            << "                                         --overfit/--steps/--batch/--lr/...)\n"
+            << "  chat <ckpt> <bpe> [message...]         chat with a BPE persona model\n";
   return 2;
 }
 
@@ -132,6 +135,8 @@ struct TrainArgs {
   float weight_decay = 0.1f;
   unsigned seed = 1337;
   bool overfit = false;  // train on a single fixed batch (the wiring sanity check)
+  bool bpe = false;      // Phase 5: byte-level BPE + <user>/<bot>/<eot> role tokens
+  int vocab = 1024;      // BPE target vocab size (only used with --bpe)
 };
 
 // Minimal flag parser: first non-flag positional is the data path; "--key value" sets a
@@ -148,6 +153,10 @@ bool parse_train_args(int argc, char** argv, TrainArgs& a) {
     };
     if (s == "--overfit") {
       a.overfit = true;
+    } else if (s == "--bpe") {
+      a.bpe = true;
+    } else if (s == "--vocab") {
+      a.vocab = std::atoi(next("--vocab").c_str());
     } else if (s == "--steps") {
       a.steps = std::atoi(next("--steps").c_str());
     } else if (s == "--batch") {
@@ -226,16 +235,14 @@ float train_batch(moo::GPT& model, const moo::Batch& batch) {
   return static_cast<float>(total / B);
 }
 
-// Sample a short continuation and decode it, so we can eyeball whether text is word-like.
-void sample_and_print(moo::GPT& model, const moo::Tokenizer& tok, std::mt19937& rng) {
-  const std::vector<char>& chars = tok.chars();
-  // Seed from a space if present, else the first vocab char.
-  int seed_id = 0;
-  for (std::size_t i = 0; i < chars.size(); ++i) {
-    if (chars[i] == ' ') { seed_id = static_cast<int>(i); break; }
-  }
+using DecodeFn = std::function<std::string(const std::vector<int>&)>;
+
+// Sample a short continuation from a seed token and decode it, so we can eyeball whether
+// output is word-like (char model) / dialogue-shaped (BPE persona model).
+void sample_and_print(moo::GPT& model, const DecodeFn& decode, int seed_id,
+                      std::mt19937& rng) {
   std::vector<int> out = model.generate({seed_id}, 200, 0.8f, 40, rng);
-  std::cout << "  sample: " << tok.decode(out) << "\n";
+  std::cout << "  sample: " << decode(out) << "\n";
 }
 
 int train(int argc, char** argv) {
@@ -243,10 +250,34 @@ int train(int argc, char** argv) {
   if (!parse_train_args(argc, argv, args)) return usage(argv[0]);
 
   const std::string text = read_file(args.data_path);
-  moo::Tokenizer tok = moo::Tokenizer::from_text(text);
-  std::vector<int> ids = tok.encode(text);
-  std::cout << "corpus: " << text.size() << " chars, vocab=" << tok.vocab_size()
-            << ", tokens=" << ids.size() << "\n";
+
+  // Tokenize with either the char-level (Phase 4) or BPE (Phase 5) tokenizer. We funnel
+  // both into a token-id stream `ids`, a `decode` for sampling, and a `seed_id`.
+  std::vector<int> ids;
+  int vocab_size = 0;
+  DecodeFn decode;
+  int seed_id = 0;
+  moo::BpeTokenizer bpe;  // kept alive for the decode closure / save when --bpe
+  moo::Tokenizer cvocab;  // kept alive likewise when char-level
+
+  if (args.bpe) {
+    bpe = moo::BpeTokenizer::train(text, args.vocab, {"<user>", "<bot>", "<eot>"});
+    ids = bpe.encode(text);
+    vocab_size = bpe.vocab_size();
+    decode = [&bpe](const std::vector<int>& v) { return bpe.decode(v); };
+    seed_id = bpe.special_id("<user>");  // seed dialogues with a user turn
+    std::cout << "tokenizer: byte-level BPE, vocab=" << vocab_size << "\n";
+  } else {
+    cvocab = moo::Tokenizer::from_text(text);
+    ids = cvocab.encode(text);
+    vocab_size = cvocab.vocab_size();
+    decode = [&cvocab](const std::vector<int>& v) { return cvocab.decode(v); };
+    const std::vector<char>& chars = cvocab.chars();  // seed from a space if present
+    for (std::size_t i = 0; i < chars.size(); ++i)
+      if (chars[i] == ' ') { seed_id = static_cast<int>(i); break; }
+    std::cout << "tokenizer: char-level, vocab=" << vocab_size << "\n";
+  }
+  std::cout << "corpus: " << text.size() << " chars, tokens=" << ids.size() << "\n";
   moo::DataLoader loader(std::move(ids), 0.1f);
 
   moo::GPTConfig cfg;
@@ -254,7 +285,7 @@ int train(int argc, char** argv) {
   cfg.n_head = args.n_head;
   cfg.n_embd = args.n_embd;
   cfg.block_size = args.block_size;
-  cfg.vocab_size = tok.vocab_size();
+  cfg.vocab_size = vocab_size;
 
   std::mt19937 rng(args.seed);
   moo::GPT model = moo::GPT::random_init(cfg, rng);
@@ -294,14 +325,19 @@ int train(int argc, char** argv) {
       std::cout << "step " << step << "  loss " << loss << "  lr " << opt.lr()
                 << std::endl;
     }
-    if (step > 0 && step % 1000 == 0) sample_and_print(model, tok, rng);
+    if (step > 0 && step % 1000 == 0) sample_and_print(model, decode, seed_id, rng);
   }
 
   std::cout << "final sample:\n";
-  sample_and_print(model, tok, rng);
+  sample_and_print(model, decode, seed_id, rng);
 
   model.save(args.out_path);
   std::cout << "saved checkpoint to " << args.out_path << "\n";
+  if (args.bpe) {
+    const std::string bpe_path = args.out_path + ".bpe";
+    bpe.save(bpe_path);
+    std::cout << "saved BPE vocab to " << bpe_path << "\n";
+  }
   return 0;
 }
 
@@ -321,6 +357,51 @@ int generate(int argc, char** argv) {
   return 0;
 }
 
+// Phase 5 chat: load a BPE persona checkpoint, take a <user> turn, sample a <bot> reply.
+// Canonical turn format (must match the training data): "<user> {text}<eot><bot> {text}<eot>".
+// We prompt with everything up to and including the <bot> token and let the model produce
+// the reply, stopping at <eot>.
+int chat(int argc, char** argv) {
+  if (argc < 4) return usage(argv[0]);
+  moo::GPT model = moo::GPT::load(argv[2]);
+  moo::BpeTokenizer bpe = moo::BpeTokenizer::load(argv[3]);
+  const int eot = bpe.special_id("<eot>");
+  if (eot < 0) {
+    std::cerr << "chat: BPE vocab has no <eot> token\n";
+    return 1;
+  }
+  std::mt19937 rng(1234);
+
+  auto reply = [&](const std::string& user) {
+    std::vector<int> prompt = bpe.encode("<user> " + user + "<eot><bot>");
+    std::vector<int> out = model.generate(prompt, 200, 0.8f, 40, rng, eot);
+    std::vector<int> span(out.begin() + prompt.size(), out.end());
+    if (!span.empty() && span.back() == eot) span.pop_back();  // drop the stop token
+    return bpe.decode(span);
+  };
+
+  // Single-turn mode: remaining args form one user message.
+  std::string single;
+  for (int i = 4; i < argc; ++i) {
+    if (!single.empty()) single += " ";
+    single += argv[i];
+  }
+  if (!single.empty()) {
+    std::cout << "<bot>" << reply(single) << "\n";
+    return 0;
+  }
+
+  // Interactive mode: read user turns from stdin until an empty line / EOF.
+  std::cout << "moo chat — type a message (empty line or EOF to quit)\n";
+  std::string line;
+  while (true) {
+    std::cout << "<user> " << std::flush;
+    if (!std::getline(std::cin, line) || line.empty()) break;
+    std::cout << "<bot>" << reply(line) << "\n";
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -332,5 +413,6 @@ int main(int argc, char** argv) {
   if (std::strcmp(cmd, "grads") == 0) return grads(argc, argv);
   if (std::strcmp(cmd, "generate") == 0) return generate(argc, argv);
   if (std::strcmp(cmd, "train") == 0) return train(argc, argv);
+  if (std::strcmp(cmd, "chat") == 0) return chat(argc, argv);
   return usage(argv[0]);
 }

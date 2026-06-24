@@ -232,7 +232,7 @@ forward and its backward match the reference.**
 - [x] P2: C++ forward logits == PyTorch (random weights loaded)
 - [x] P3: all gradients pass finite-diff **and** autograd checks
 - [x] P4: single-batch loss → ~0; real training loss decreasing; word-like samples
-- [ ] P5: persona model holds a basic, cute, clean conversation
+- [x] P5: persona model holds a basic, cute, clean conversation
 - [ ] P6 (stretch): GPU path matches CPU path
 
 ---

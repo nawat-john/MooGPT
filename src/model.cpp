@@ -288,7 +288,8 @@ std::vector<Tensor*> GPT::gradients() {
 }
 
 std::vector<int> GPT::generate(const std::vector<int>& prompt, int max_new_tokens,
-                               float temperature, int top_k, std::mt19937& rng) {
+                               float temperature, int top_k, std::mt19937& rng,
+                               int stop_id) {
   std::vector<int> seq = prompt;
   const int V = cfg.vocab_size;
 
@@ -329,7 +330,9 @@ std::vector<int> GPT::generate(const std::vector<int>& prompt, int max_new_token
     for (int i = 0; i < V; ++i) row[i] /= sum;
 
     std::discrete_distribution<int> dist(row.begin(), row.end());
-    seq.push_back(dist(rng));
+    const int next = dist(rng);
+    seq.push_back(next);
+    if (next == stop_id) break;  // e.g. <eot> ends a chat turn
   }
   return seq;
 }

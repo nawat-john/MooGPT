@@ -45,6 +45,9 @@ env/
 data/*.txt
 # curated sample corpus, small & on-theme — keep tracked for the P4 gate
 !data/tiny.txt
+# hand-written persona seed — small, defines the chat format; the bulk persona.txt /
+# persona.clean.txt stay ignored (large & reproducible from generate_dialogues.py)
+!data/persona_seed.txt
 data/raw/
 data/cache/
 checkpoints/
