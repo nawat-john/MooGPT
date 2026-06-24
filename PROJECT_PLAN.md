@@ -233,7 +233,8 @@ forward and its backward match the reference.**
 - [x] P3: all gradients pass finite-diff **and** autograd checks
 - [x] P4: single-batch loss → ~0; real training loss decreasing; word-like samples
 - [x] P5: persona model holds a basic, cute, clean conversation
-- [ ] P6 (stretch): GPU path matches CPU path
+- [x] P6a (stretch): CPU OpenMP parallelism — ~3.7× on 16 cores, all verification gates unchanged
+- [ ] P6b (stretch): GPU/CUDA path matches CPU path — blocked: CUDA Toolkit (nvcc) not installed
 
 ---
 

@@ -480,6 +480,72 @@ checkpoint round-trips through `save`/`load` and `chat` reads it back via the `.
 
 ---
 
+## Phase 6 — Performance (CPU parallelism)
+
+The stretch phase. Goal: make the fast path faster **without changing what it computes** — the
+gate is "same loss/outputs as the verified CPU path." On this machine the RTX 3050 has a driver
+but **no CUDA Toolkit (`nvcc`)**, so the CUDA route can't be built/verified here; the CPU route
+(the plan's other option, "speed up matmul … on CPU") is what we did: OpenMP across the 16 cores.
+
+### The rule that keeps results identical: parallelize over *owned outputs*, not reductions
+
+A floating-point sum is not associative, so changing the *order* of a reduction changes the last
+bits. The safe transform is to give each thread a disjoint set of **output** elements and let it
+run the *same* serial reduction for each — every output is written by exactly one thread (no race)
+and every dot-product keeps its original summation order (no reassociation). Results are then
+independent of thread count. Where each hot loop's output lives decides which axis to parallelize:
+
+- **`matmul` / `linear` (forward):** output element `(i,j)` / row `t` is computed by one
+  iteration; parallelize over rows (`i` / `t`). The inner `k`/`in` sum is untouched. Identical.
+- **`linear_backward`:** the catch — `dx` is indexed by `t` but `dW`/`dB` by `o` (opposite axes).
+  The fused serial loop accumulates both at once, so *neither* axis can be the parallel loop
+  without racing the other target. Fix: **split into two passes** —
+  - pass 1 `dx[t,i] += Σ_o dy[t,o]·W[o,i]`, parallel over `t` (each `t` owns its `dx` row);
+  - pass 2 `dW[o,i] += Σ_t dy[t,o]·x[t,i]`, `dB[o] += Σ_t dy[t,o]`, parallel over `o` (each `o`
+    owns its `dW` row + `dB[o]`).
+
+  `dx` still sums over `o` ascending and `dW`/`dB` over `t` ascending, exactly as the fused loop
+  did — so the split is bit-identical to serial, and now both passes parallelize race-free. Cost:
+  `dy`/`x` are read twice; cheap next to the FLOPs saved.
+- **Attention (fwd + bwd):** the `for h` loop. Head `h` reads only its own Q/K/V column slices of
+  `qkv` and writes only its own slice of `out_heads` / `dqkv` (offsets `h·d`, `C+h·d`, `2C+h·d`
+  never overlap across heads); `scores`/`probs`/`dprobs` are per-iteration locals. So heads are
+  independent both ways → parallelize over `h`. (The `linear` calls sit *outside* the `h` loop, so
+  no nested parallel regions form; nested OpenMP is off by default anyway.)
+
+Each `#pragma omp parallel for` carries an `if (size > …)` guard so the tiny tensors in the
+verification tests stay serial and don't pay fork/join overhead.
+
+### Why it isn't *bit*-identical to the old serial binary (and why that's fine)
+
+The single forward/backward gates still pass at the **same** tolerances as before (Phase 2 logits
+max-abs ~6.6e-7 ≤ 1e-4; Phase 3 grads worst-rel ~4.8e-4 ≤ 1e-3). But a 100-step overfit loss
+differs in the ~7th digit (`0.0194090` vs `0.0194094`). That drift is **FP contraction**, not a
+logic bug: at `-O2` GCC may fuse `a += b*c` into a single `fma` (one rounding instead of two), and
+whether it does so depends on how a loop is vectorized/structured — which the restructuring above
+changes. It's ~1 ULP per op, chaotically amplified over 100 optimization steps. Re-running the
+parallel binary reproduces `0.0194094` **exactly**, which is the real safety check: identical
+output run-to-run ⇒ no data race. (To force literal serial/parallel bit-equality one could compile
+`-ffp-contract=off`, at a small speed cost; not worth it — the project's contract is tolerance
+matching against the PyTorch oracle, which holds.)
+
+### Result & verification
+
+`train … --batch 16 --block 64 --layer 4 --head 4 --embd 128`, 100 overfit steps:
+**103.3 s → 28.1 s, ~3.7× on 16 cores.** All five C++ suites green (incl. `test_grad` FD checks
+and `test_ops` matmul), the determinism re-run matches to the last digit, and both PyTorch gates
+PASS unchanged. Amdahl-limited by attention only reaching `H`-way (4) parallelism while the linears
+reach `T`/`o`-way (≥64); pushing attention to per-`i` parallelism is the next lever if needed.
+
+### Build / runtime
+
+`-fopenmp` added to every g++ line and `find_package(OpenMP)` to CMake (both optional — without
+it the pragmas no-op to the serial path). libgomp links statically under `-static`, so the exe
+stays DLL-free. `OMP_NUM_THREADS` caps threads at run time. **CUDA/GPU remains unbuilt** — it needs
+the Toolkit installed; the verified CPU path is the reference any future GPU path must match.
+
+---
+
 ## Build environment (this machine)
 
 CMake is **not** installed. Two compilers are present:

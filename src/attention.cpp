@@ -19,6 +19,12 @@ Tensor CausalSelfAttention::forward(const Tensor& x) {
   out_heads_ = Tensor({T, C});
   probs_.assign(H, Tensor());
 
+  // Phase 6: heads are independent — head h reads only its own Q/K/V column slices of
+  // qkv_ and writes only its own column slice of out_heads_ and the distinct probs_[h].
+  // `scores`/`probs` are per-iteration locals. So parallelizing over h has no races and
+  // is bit-identical to the serial loop. (linear() is called outside this loop, so no
+  // nested parallel regions arise.)
+#pragma omp parallel for schedule(static) if (H > 1)
   for (int h = 0; h < H; ++h) {
     const int qoff = h * d;
     const int koff = C + h * d;
@@ -69,6 +75,10 @@ Tensor CausalSelfAttention::backward(const Tensor& dy) {
   // Gradient w.r.t. the fused QKV (T, 3C), filled per head.
   Tensor dqkv({T, 3 * C});
 
+  // Phase 6: same per-head independence as forward — head h writes only its disjoint
+  // q/k/v column ranges of dqkv ([qoff..), [koff..), [voff..)), and d_out_heads/probs_
+  // are read-only here. dprobs/dscores are per-iteration locals. Race-free, bit-identical.
+#pragma omp parallel for schedule(static) if (H > 1)
   for (int h = 0; h < H; ++h) {
     const int qoff = h * d;
     const int koff = C + h * d;

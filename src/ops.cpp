@@ -32,6 +32,12 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
   // Naive triple loop. Row-major layout means a[i,k] is at i*K + k and b[k,j] is at
   // k*N + j. The i-k-j order keeps the inner loop striding contiguously over b's row
   // and out's row, which is friendlier to the cache than i-j-k.
+  //
+  // Phase 6: parallelize over output rows i. Each i owns a distinct row of `out`, so
+  // there is no write race, and the inner k-summation order is unchanged — results are
+  // bit-identical to the serial loop regardless of thread count. `if(M > 8)` skips the
+  // fork/join overhead for the tiny matrices the verification tests use.
+#pragma omp parallel for schedule(static) if (M > 8)
   for (int i = 0; i < M; ++i) {
     for (int k = 0; k < K; ++k) {
       const float aik = ap[i * K + k];
@@ -87,6 +93,10 @@ Tensor linear(const Tensor& x, const Tensor& weight, const Tensor& bias) {
   const float* bp = has_bias ? bias.data() : nullptr;
   float* yp = y.data();
 
+  // Phase 6: parallelize over rows t (one output row per thread, dot-product order
+  // unchanged → bit-identical). This is the dominant forward cost (lm_head, c_attn,
+  // c_proj, the two MLP linears all route through here).
+#pragma omp parallel for schedule(static) if (T > 8)
   for (int t = 0; t < T; ++t) {
     const float* xrow = xp + t * in;
     float* yrow = yp + t * out;
@@ -173,20 +183,41 @@ Tensor linear_backward(const Tensor& x, const Tensor& weight, const Tensor& dy,
 
   Tensor dx({T, in});
   // dx = dy @ W ;  dW += dy^T @ x ;  db += colsum(dy)
+  //
+  // Phase 6: the serial version fused both accumulations in one t-o-i loop, but dx is
+  // owned by t while dW/dB are owned by o — opposite axes, so neither can be the parallel
+  // loop without a write race on the other target. Splitting into two passes lets each
+  // pass parallelize over the axis that owns its output, with no races. Each reduction
+  // keeps its original order (dx sums over o ascending; dW/dB sum over t ascending), so
+  // the gradients are bit-identical to the fused serial loop.
+
+  // Pass 1: dx[t,i] += sum_o dy[t,o] * W[o,i]  — parallel over t (each t owns dx row t).
+#pragma omp parallel for schedule(static) if (T > 8)
   for (int t = 0; t < T; ++t) {
     const float* dyr = dy.data() + t * out;
-    const float* xr = x.data() + t * in;
     float* dxr = dx.data() + t * in;
     for (int o = 0; o < out; ++o) {
       const float g = dyr[o];
       const float* wr = weight.data() + o * in;
-      float* dWr = dW.data() + o * in;
-      for (int i = 0; i < in; ++i) {
-        dxr[i] += g * wr[i];   // dx[t,i] += dy[t,o] * W[o,i]
-        dWr[i] += g * xr[i];   // dW[o,i] += dy[t,o] * x[t,i]
-      }
-      if (has_bias) dB[o] += g;
+      for (int i = 0; i < in; ++i) dxr[i] += g * wr[i];
     }
+  }
+
+  // Pass 2: dW[o,i] += sum_t dy[t,o] * x[t,i] ; dB[o] += sum_t dy[t,o]  — parallel over o
+  // (each o owns dW row o and dB[o]).
+  const float* dyp = dy.data();
+  const float* xp = x.data();
+#pragma omp parallel for schedule(static) if (out > 8)
+  for (int o = 0; o < out; ++o) {
+    float* dWr = dW.data() + o * in;
+    float db = 0.0f;
+    for (int t = 0; t < T; ++t) {
+      const float g = dyp[t * out + o];
+      const float* xr = xp + t * in;
+      for (int i = 0; i < in; ++i) dWr[i] += g * xr[i];
+      db += g;
+    }
+    if (has_bias) dB[o] += db;
   }
   return dx;
 }

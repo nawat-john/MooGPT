@@ -20,6 +20,10 @@ else()
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# Phase 6: OpenMP parallelizes the hot loops (matmul / linear / attention). Optional —
+# without it the #pragma omp lines are ignored and the build is the serial CPU path.
+find_package(OpenMP)
+
 # --- Core library (everything except main) -----------------------------------
 # As phases land, add their .cpp files here (attention, mlp, model, ...).
 add_library(moocore
@@ -36,6 +40,9 @@ add_library(moocore
   src/optimizer.cpp
 )
 target_include_directories(moocore PUBLIC src)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(moocore PUBLIC OpenMP::OpenMP_CXX)
+endif()
 
 # --- Executable --------------------------------------------------------------
 add_executable(moogpt src/main.cpp)

@@ -85,29 +85,36 @@ the compiler to PATH: `$env:Path = "C:\msys64\ucrt64\bin;$env:Path"`.
 
 Build + run the test suites (each exits 0 = all checks passed):
 ```
-g++ -std=c++17 -static -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/ops.cpp tests/test_ops.cpp -o build/test_ops.exe
+g++ -std=c++17 -fopenmp -static -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/ops.cpp tests/test_ops.cpp -o build/test_ops.exe
 build/test_ops.exe        # Phase 0: tensor + ops
 
-g++ -std=c++17 -static -Wall -Wextra -Wpedantic -I src src/tokenizer.cpp src/dataloader.cpp tests/test_data.cpp -o build/test_data.exe
+g++ -std=c++17 -fopenmp -static -Wall -Wextra -Wpedantic -I src src/tokenizer.cpp src/dataloader.cpp tests/test_data.cpp -o build/test_data.exe
 build/test_data.exe       # Phase 1: tokenizer + dataloader
 
-g++ -std=c++17 -static -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/ops.cpp src/loss.cpp tests/test_grad.cpp -o build/test_grad.exe
+g++ -std=c++17 -fopenmp -static -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/ops.cpp src/loss.cpp tests/test_grad.cpp -o build/test_grad.exe
 build/test_grad.exe       # Phase 3: finite-difference gradient checks
 
-g++ -std=c++17 -static -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/optimizer.cpp tests/test_optim.cpp -o build/test_optim.exe
+g++ -std=c++17 -fopenmp -static -Wall -Wextra -Wpedantic -I src src/tensor.cpp src/optimizer.cpp tests/test_optim.cpp -o build/test_optim.exe
 build/test_optim.exe      # Phase 4: AdamW (convex minimization + weight-decay behavior)
 
-g++ -std=c++17 -static -Wall -Wextra -Wpedantic -I src src/bpe.cpp tests/test_bpe.cpp -o build/test_bpe.exe
+g++ -std=c++17 -fopenmp -static -Wall -Wextra -Wpedantic -I src src/bpe.cpp tests/test_bpe.cpp -o build/test_bpe.exe
 build/test_bpe.exe        # Phase 5: BPE round-trip, special tokens, determinism, save/load
 ```
 Build the full CLI (`demo`/`check`/`grads`/`generate`/`train`/`chat` all work):
 ```
-g++ -std=c++17 -O2 -static -I src src/tensor.cpp src/ops.cpp src/tokenizer.cpp src/bpe.cpp src/dataloader.cpp \
+g++ -std=c++17 -O2 -fopenmp -static -I src src/tensor.cpp src/ops.cpp src/tokenizer.cpp src/bpe.cpp src/dataloader.cpp \
     src/attention.cpp src/mlp.cpp src/block.cpp src/model.cpp src/loss.cpp src/optimizer.cpp src/main.cpp -o build/moogpt.exe
 ```
 When new `.cpp` files land, add them to both the g++ command and the `moocore` library in
 `CMakeLists.txt`. Once CMake is installed, prefer `cmake -S . -B build && cmake --build build`
 then `ctest --test-dir build`.
+
+**`-fopenmp` is the Phase 6 speedup** (matmul / linear / attention parallelized across cores;
+~3.7× on 16 cores here). It is optional: drop the flag and the `#pragma omp` lines are ignored,
+giving the identical serial CPU path. Control threads at run time with `OMP_NUM_THREADS`. The
+parallel decomposition is race-free *and* keeps every reduction's order, so results match the
+serial/PyTorch gates within the same tolerances (Phase 2 ~6e-7 logits, Phase 3 ~4e-4 grads) — see
+`docs/notes.md` Phase 6. libgomp links statically under `-static`, so the exe stays self-contained.
 
 The C++ test harness is dependency-free (no gtest/Catch): each `tests/*.cpp` counts checks and
 returns a non-zero exit code on failure, so it gates cleanly. No single-test filter yet — add one

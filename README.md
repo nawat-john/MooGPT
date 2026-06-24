@@ -28,7 +28,8 @@ token + learned positional embeddings
 ```
 
 - **Precision:** fp32 everywhere (easiest to reason about).
-- **Compute:** CPU-first with naive loops; GPU/BLAS is a later, optional phase.
+- **Compute:** CPU-first with naive loops, then OpenMP multi-core parallelism (Phase 6);
+  GPU/CUDA is a further optional phase.
 - **Tokenizer:** char-level (Phases 0–4), then a from-scratch byte-level BPE with role tokens
   (`<user>`/`<bot>`/`<eot>`) for the Phase 5 chat model.
 
@@ -65,7 +66,7 @@ and the Phase 5 `chat` command holds a short, on-tone, clean conversation as Moo
 | **P3** ✅ | Loss + backprop | All gradients pass finite-diff **and** autograd checks |
 | **P4** ✅ | AdamW + training loop | Single-batch loss → ~0; real loss decreases; word-like samples |
 | **P5** ✅ | Conversational persona | BPE + role tokens; holds a cute, clean `<user>`/`<bot>` chat |
-| **P6** | Performance & GPU *(stretch)* | GPU path matches the verified CPU path |
+| **P6** ◐ | Performance & GPU *(stretch)* | CPU: OpenMP parallelism, ~3.7× on 16 cores, gates unchanged ✅. GPU/CUDA: pending toolkit |
 
 See [`PROJECT_PLAN.md`](PROJECT_PLAN.md) for the full design, data plan, and learning resources,
 and [`docs/notes.md`](docs/notes.md) for the per-phase math derivations.
@@ -96,12 +97,16 @@ ctest --test-dir build --output-on-failure
 If CMake isn't available, build directly with a C++17 compiler (e.g. g++). The full CLI:
 
 ```
-g++ -std=c++17 -O2 -static -I src \
+g++ -std=c++17 -O2 -fopenmp -static -I src \
     src/tensor.cpp src/ops.cpp src/tokenizer.cpp src/bpe.cpp src/dataloader.cpp \
     src/attention.cpp src/mlp.cpp src/block.cpp src/model.cpp src/loss.cpp \
     src/optimizer.cpp src/main.cpp -o build/moogpt.exe
 build/moogpt.exe demo     # hand-checked matmul demo
 ```
+
+`-fopenmp` enables the Phase 6 multi-core speedup (matmul / linear / attention parallelized,
+~3.7× on 16 cores); it's optional — without it the build is the identical serial CPU path.
+`OMP_NUM_THREADS` controls the thread count at run time.
 
 Each test suite is a standalone target that exits 0 when all checks pass — see
 [`CLAUDE.md`](CLAUDE.md) for the per-suite build/run commands and the PyTorch verification gates.
