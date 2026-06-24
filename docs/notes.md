@@ -537,6 +537,49 @@ and `test_ops` matmul), the determinism re-run matches to the last digit, and bo
 PASS unchanged. Amdahl-limited by attention only reaching `H`-way (4) parallelism while the linears
 reach `T`/`o`-way (≥64); pushing attention to per-`i` parallelism is the next lever if needed.
 
+### Per-i (query-row) parallelism — pushing attention past H-way
+
+The first cut parallelized attention over the `for h` loop only — **H-way** (= 4 here), the Amdahl
+bottleneck the result section flagged, since the linears already reach `T`/`o`-way (≥ 64). The fix
+is to parallelize over the **flattened `(h, i)` query-row space** (`hi = h*T + i`), giving
+**`H*T`-way** (e.g. 4·64 = 256, well past the 16 cores) with the *same* "own your outputs, never a
+reduction" rule:
+
+- **Forward.** Query row `i` of head `h` owns row `i` of `probs_[h]` and row `i` of head `h`'s
+  column slice of `out_heads_`. Both are disjoint across `(h,i)` ⇒ no race. The softmax is inlined
+  per row over `j ≤ i` instead of calling `softmax_rows` on a full `(T,T)` matrix, but reproduces
+  its exact arithmetic: max over the finite entries, then `exp`/`sum` in ascending `j`. The masked
+  `j > i` entries `softmax_rows` would have added as `exp(-inf) = 0` are simply skipped — adding
+  `+0.0f` changes nothing — so the row is identical and the reduction order is preserved. `probs_[h]`
+  is pre-allocated (zero-filled) so the skipped upper triangle stays 0 for backward.
+
+- **Backward.** Same ownership conflict as `linear_backward`: `dq` and the softmax JVP are owned by
+  query row `i`, but `dv`/`dk` accumulate over `i` into key/value row `j` (opposite axis). One fused
+  `for h` loop can't go per-`i` without racing `dv`/`dk`. So split into passes, each parallel over
+  the axis (flattened with `h`) that *owns* its output:
+  - **Pass B** (own `(h,i)`): `dprobs[i,j] = Σ_e dO[i,e]·V[j,e]`, then the per-row softmax-backward
+    `dscores[i,·] = P[i,·]⊙(dprobs − Σ_j dprobs·P)` → written to row `i` of a materialized per-head
+    `dscores` (H tensors of `(T,T)`, ~256 KB total — cheap). `dscores` row scratch doubles as the
+    `dprobs` buffer, so no extra allocation.
+  - **Pass A** (own `(h,j)`): `dV[j] += Σ_{i≥j} P[i,j]·dO[i]`. Independent of `dscores`.
+  - **Pass C** (own `(h,i)`): `dQ[i] += scale·Σ_{j≤i} dscores[i,j]·K[j]`.
+  - **Pass D** (own `(h,j)`): `dK[j] += scale·Σ_{i≥j} dscores[i,j]·Q[i]`.
+
+  Each reduction keeps its original ascending order (`dV`/`dK` over `i` ascending; `dQ`/`dprobs`
+  over `j` ascending), so the split is arithmetically identical to the old fused loop — just race-free
+  at `H*T`-way. Cost: `dscores` is materialized and a couple of inputs are re-read; negligible vs the
+  FLOPs. Passes A and C/D depend on B's `dscores`, so B runs first; A is independent and can run any
+  time.
+
+**Result.** Same 100-step overfit config (`--batch 16 --block 64 --layer 4 --head 4 --embd 128`):
+**111.8 s → 27.4 s, ~4.1× on 16 cores** (up from ~3.7× when attention was only H-way). All gates
+hold at the same tolerances (Phase 2 logits 6.6e-7, Phase 3 grads worst-rel 4.75e-4). Notably the
+per-`i` parallel loss now equals the **serial** loss to the last printed digit (`0.0194094` both,
+and run-to-run), tightening the ~1-ULP serial/parallel drift the H-way version had — the
+restructured loops happen to let GCC make the same FP-contraction choices on both paths. Identical
+output regardless of thread count remains the real no-race check. Further headroom is now in the
+linears (matmul), not attention.
+
 ### Build / runtime
 
 `-fopenmp` added to every g++ line and `find_package(OpenMP)` to CMake (both optional — without
@@ -545,6 +588,80 @@ stays DLL-free. `OMP_NUM_THREADS` caps threads at run time. **CUDA/GPU remains u
 the Toolkit installed; the verified CPU path is the reference any future GPU path must match.
 
 ---
+
+## Phase 6b — GPU / CUDA (forward inference)
+
+The other branch of the stretch phase, finally unblocked once the CUDA Toolkit was installed. Goal
+is unchanged from the plan: a GPU path that produces the **same outputs as the verified CPU path**.
+Scope here is **forward inference only** — `src/forward_cuda.cu` mirrors `GPT::forward`; backward /
+training on the GPU is future work. The CPU path (and through it the PyTorch oracle) stays the
+reference any GPU result is measured against.
+
+### Design: one standalone `.cu`, no host C++, no cuBLAS
+
+`forward_cuda.cu` is a single translation unit compiled by `nvcc`. It re-parses the MGPT weight file
+itself (same canonical order as `model.cpp::load` — the binary format is the contract, exactly as
+`check.py` duplicates the layout) and writes logits in the same `int32 T, int32 V, float32[T*V]`
+format `moogpt check` uses, so `reference/check.py` verifies it with no new harness. It links none of
+the host classes — deliberately, so the GPU path can't accidentally share (or diverge from) CPU code.
+
+**Kernels are hand-written, not cuBLAS — and that is the point.** A BLAS GEMM picks its own
+tiling/summation order, so its fp32 result would drift from the CPU's ascending-order dot products
+(the same non-associativity lesson as Phase 6a). Instead each kernel keeps the *identical* reduction
+order as its CPU op:
+
+- **embed / add** — one thread per element.
+- **layernorm** — one thread per row `t`; mean, then biased variance (÷C, eps 1e-5), then
+  `(x−mean)·rstd·γ+β`, same sweep order as `ops.cpp`.
+- **linear** — one thread per output `(t,o)`; `acc=bias; for i: acc += x[t,i]·W[o,i]` ascending `i`,
+  matching `linear`'s inner loop. `W` is `(out,in)` as everywhere else.
+- **gelu** — exact erf (`erff`), `0.5·v·(1+erf(v/√2))`.
+- **attention** — one thread per `(head, query-row)` `hi = h*T+i`, the *same per-`i` decomposition*
+  as the Phase 6a CPU attention: each thread owns row `i` of head `h` (disjoint outputs, no race),
+  inlines the causal softmax over `j ≤ i` (max over the finite entries, then exp/sum ascending `j`,
+  normalize), then `out_i = Σ_{j≤i} p·v_j`. Bit-for-bit the CPU arithmetic, just on the device.
+
+So the match to the oracle is "same math, same order, different hardware," not "close enough." One
+thread per output element is **not** the fastest possible kernel (no shared-memory tiling, no fused
+QKV) — correctness and matching the reference come first, per the project's correctness→clarity→speed
+ordering. Tuning is future work; the headroom is obvious (tile the linears, fuse attention).
+
+### Toolchain (the actual blocker — and two traps)
+
+The plan flagged Phase 6b "blocked: no nvcc." Installing it surfaced two version traps worth recording:
+
+1. **Toolkit must match the driver, not the latest.** Driver 572.42 supports **CUDA 12.8**. winget
+   offers up to 13.3, but a 13.x toolkit needs a ~580+ driver — it compiles fine yet fails at runtime
+   with "CUDA driver version is insufficient for CUDA runtime version." Installed **CUDA 12.8**
+   (`winget install Nvidia.CUDA --version 12.8`) to match.
+2. **`nvcc` needs a host MSVC it actually supports.** The only MSVC present was toolset **14.51**
+   (VS 18 / "2026"). nvcc 12.8 tops out at VS 2022 (14.4x); 14.51's headers crash nvcc's front-end
+   (`'cudafe++' died with status 0xC0000005 (ACCESS_VIOLATION)`). `-allow-unsupported-compiler`
+   silences the *version check* but can't stop the crash. Fix: install **VS 2022 BuildTools** with
+   the pinned **14.43** toolset (CUDA 12.8's documented max) and select it at build time.
+
+Build (RTX 3050 = Ampere = `sm_86`):
+```
+call "...\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.43
+nvcc -O2 -std=c++17 -arch=sm_86 -allow-unsupported-compiler \
+  -ccbin "...\2022\BuildTools\VC\Tools\MSVC\14.43.34808\bin\Hostx64\x64" \
+  -o build/moogpt_cuda.exe src/forward_cuda.cu
+```
+(The `vswhere.exe is not recognized` line vcvars prints and the `-INFINITY → (float)1e300` warning
+are both harmless noise.)
+
+### Result & verification
+
+`python reference/export_weights.py` → `build/moogpt_cuda.exe weights input cuda_logits.bin` →
+`python reference/check.py --cpp cuda_logits.bin`:
+
+- Default tiny config (3 layers, C=64, T=12): GPU vs **PyTorch** max-abs **4.77e-7**; GPU vs the
+  **CPU** path **7.15e-7**.
+- Starter config (4 layers, C=128, H=4, T=128, 834k params): GPU vs PyTorch **9.54e-7**.
+
+All well inside the 1e-4 gate. **P6b gate passed** — the GPU forward reproduces the verified CPU /
+PyTorch logits. Remaining work (optional): GPU backward + training, and kernel tuning (the current
+naive one-thread-per-output kernels prioritize matching the oracle over speed).
 
 ## Build environment (this machine)
 

@@ -66,14 +66,18 @@ Work proceeds in phases (PROJECT_PLAN.md §5); each has a verification gate that
 - **P3** All gradients pass *both* finite-diff and autograd checks. Attention backward is the hardest — budget extra time.
 - **P4** AdamW + training loop; single-batch loss drives to ~0 (proves wiring), real loss decreases, samples become word-like.
 - **P5** BPE tokenizer + role tokens (`<user>`/`<bot>`); persona model holds a cute, clean conversation.
-- **P6** (stretch) GPU/CUDA path on the local RTX 3050 produces the same loss/outputs as the verified CPU path.
+- **P6a** (stretch) CPU OpenMP parallelism — matmul/linear over output rows, attention over the flattened `(head, query-row)` space (`H*T`-way); ~4.1× on 16 cores, all gates unchanged.
+- **P6b** (stretch) GPU/CUDA **forward** path on the local RTX 3050 matches the verified CPU/PyTorch logits (~5e-7, gate 1e-4). Inference only — no GPU training/backward yet.
 
 ## Build & run
 
 **CMake is not installed on this machine** (checked Phase 0). `CMakeLists.txt` exists as the
 intended build, but builds are currently done directly with **g++ 14.2.0** at
-`C:\msys64\ucrt64\bin\g++.exe`. MSVC BuildTools 18 (`cl.exe`) is also present. To compile, prepend
-the compiler to PATH: `$env:Path = "C:\msys64\ucrt64\bin;$env:Path"`.
+`C:\msys64\ucrt64\bin\g++.exe`. MSVC BuildTools 18 (`cl.exe`, toolset 14.51) is also present. To
+compile, prepend the compiler to PATH: `$env:Path = "C:\msys64\ucrt64\bin;$env:Path"`. The CPU
+build never needs MSVC — it uses g++. MSVC is only the host compiler for the CUDA path, and **its
+14.51 toolset crashes `nvcc`'s `cudafe++`** — see the Phase 6b CUDA subsection for the fix
+(VS 2022 BuildTools toolset 14.43 + `-ccbin`).
 
 **Two PATH gotchas, both learned in Phase 2 — important:**
 1. **Build with `-static`.** Otherwise the exe depends on UCRT64 runtime DLLs and fails with
@@ -109,8 +113,9 @@ When new `.cpp` files land, add them to both the g++ command and the `moocore` l
 `CMakeLists.txt`. Once CMake is installed, prefer `cmake -S . -B build && cmake --build build`
 then `ctest --test-dir build`.
 
-**`-fopenmp` is the Phase 6 speedup** (matmul / linear / attention parallelized across cores;
-~3.7× on 16 cores here). It is optional: drop the flag and the `#pragma omp` lines are ignored,
+**`-fopenmp` is the Phase 6 speedup** (matmul / linear parallelized over output rows, attention
+over the flattened `(head, query-row)` space — i.e. `H*T`-way, not just per-head; ~4.1× on 16 cores
+here). It is optional: drop the flag and the `#pragma omp` lines are ignored,
 giving the identical serial CPU path. Control threads at run time with `OMP_NUM_THREADS`. The
 parallel decomposition is race-free *and* keeps every reduction's order, so results match the
 serial/PyTorch gates within the same tolerances (Phase 2 ~6e-7 logits, Phase 3 ~4e-4 grads) — see
@@ -119,6 +124,39 @@ serial/PyTorch gates within the same tolerances (Phase 2 ~6e-7 logits, Phase 3 ~
 The C++ test harness is dependency-free (no gtest/Catch): each `tests/*.cpp` counts checks and
 returns a non-zero exit code on failure, so it gates cleanly. No single-test filter yet — add one
 (e.g. an argv name match) if a suite grows large.
+
+### Phase 6b — CUDA build & verification gate (GPU forward vs PyTorch)
+
+The GPU path is a **single standalone file**, `src/forward_cuda.cu`, that mirrors `GPT::forward` on
+the device and dumps logits in the exact same binary format as `moogpt check`, so `reference/check.py`
+verifies it against the PyTorch oracle. It re-parses the MGPT weight file itself (the format is the
+contract) and links none of the host C++ — it compiles as one translation unit with `nvcc`. It is
+**forward inference only** (no backward/training on the GPU).
+
+Toolchain on this machine: driver 572.42 → **CUDA 12.8** (installed at
+`C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8`). Two gotchas, both important:
+1. **Match the toolkit to the driver.** The driver caps the runtime at CUDA 12.8, so the 12.8
+   toolkit is required — a 13.x toolkit compiles but fails at runtime ("driver version insufficient").
+2. **`nvcc` needs a host MSVC it supports.** The default 14.51 toolset (VS 18) crashes `cudafe++`
+   with an ACCESS_VIOLATION. VS 2022 BuildTools toolset **14.43** was installed for this; select it
+   in the build (`-vcvars_ver=14.43` + `-ccbin`). `-allow-unsupported-compiler` is also passed.
+
+Build (from a `cmd` shell so MSVC `vcvars` works; nvcc + 14.43 host compiler):
+```
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.43
+nvcc -O2 -std=c++17 -arch=sm_86 -allow-unsupported-compiler ^
+  -ccbin "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.43.34808\bin\Hostx64\x64" ^
+  -o build/moogpt_cuda.exe src/forward_cuda.cu
+```
+`-arch=sm_86` is the RTX 3050 (Ampere). Run the gate from a clean shell:
+```
+python reference/export_weights.py
+build/moogpt_cuda.exe reference/artifacts/weights.bin reference/artifacts/input.bin reference/artifacts/cuda_logits.bin
+python reference/check.py --cpp reference/artifacts/cuda_logits.bin   # PASS if max abs diff <= 1e-4 (~5e-7)
+```
+Hand-written kernels (no cuBLAS) keep each reduction in the **same ascending order** as the CPU loops,
+so GPU↔CPU logits match to ~7e-7 and GPU↔PyTorch to ~5e-7 (starter config, T=128: ~9.5e-7). See
+`docs/notes.md` Phase 6b.
 
 ### Phase 2 verification gate (C++ forward vs PyTorch)
 

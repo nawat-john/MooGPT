@@ -234,7 +234,8 @@ forward and its backward match the reference.**
 - [x] P4: single-batch loss → ~0; real training loss decreasing; word-like samples
 - [x] P5: persona model holds a basic, cute, clean conversation
 - [x] P6a (stretch): CPU OpenMP parallelism — ~3.7× on 16 cores, all verification gates unchanged
-- [ ] P6b (stretch): GPU/CUDA path matches CPU path — blocked: CUDA Toolkit (nvcc) not installed
+- [x] P6a+ (stretch): per-i (query-row) attention parallelism (H*T-way) — ~4.1×, gates unchanged
+- [x] P6b (stretch): GPU/CUDA forward path matches CPU/PyTorch logits (RTX 3050, CUDA 12.8) — ~5e-7, inference only
 
 ---
 

@@ -48,6 +48,27 @@ endif()
 add_executable(moogpt src/main.cpp)
 target_link_libraries(moogpt PRIVATE moocore)
 
+# --- Phase 6b: optional CUDA forward path ------------------------------------
+# Standalone single-TU GPU forward (src/forward_cuda.cu), not linked to moocore. Off by
+# default and only built if a CUDA toolkit is present, so the CPU build never needs nvcc.
+# Verify with reference/check.py exactly like `moogpt check` (see CLAUDE.md Phase 6b).
+option(MOOGPT_CUDA "Build the CUDA forward path (moogpt_cuda)" OFF)
+if(MOOGPT_CUDA)
+  include(CheckLanguage)
+  check_language(CUDA)
+  if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    add_executable(moogpt_cuda src/forward_cuda.cu)
+    # RTX 3050 is Ampere (sm_86); 14.51 MSVC crashes nvcc, so configure with a 14.43 host
+    # compiler (-DCMAKE_CUDA_HOST_COMPILER=...cl.exe) — see CLAUDE.md Phase 6b.
+    set_target_properties(moogpt_cuda PROPERTIES CUDA_ARCHITECTURES 86)
+    target_compile_options(moogpt_cuda PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--allow-unsupported-compiler>)
+  else()
+    message(WARNING "MOOGPT_CUDA=ON but no CUDA compiler found; skipping moogpt_cuda.")
+  endif()
+endif()
+
 # --- Tests -------------------------------------------------------------------
 enable_testing()
 
